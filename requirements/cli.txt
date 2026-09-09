@@ -1,5 +1,5 @@
 matplotlib
 openai
 # Required by `lmcache describe`, which parses Prometheus metrics text.
-prometheus_client >= 0.18.0, <= 0.24.1
+prometheus_client <= 0.26.0, >= 0.26.0
 sortedcontainers
