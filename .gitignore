@@ -160,11 +160,4 @@ docs/source/locale/**/*.mo
 
 # CodeBuddy
 .codebuddy
-
-# Closed-source SurData SDK leftovers (never ship)
-src/surdata_lmcache/
-csrc/storage_backends/surdata/
-csrc/surdata_conn.*
-setup_extensions/storage_backend_profiles/surdata.py
-.surdata_fork_sha
-bench/results/
+.venv-test/

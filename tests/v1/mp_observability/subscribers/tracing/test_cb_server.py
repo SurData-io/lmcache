@@ -1,0 +1,931 @@
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for BlendTracingSubscriber."""
+
+# Standard
+from unittest.mock import patch
+import time
+
+# Third Party
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+import pytest
+
+# First Party
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
+from lmcache.v1.mp_observability.subscribers.tracing.cb_server import (
+    BlendTracingSubscriber,
+)
+from lmcache.v1.mp_observability.subscribers.tracing.span_registry import (
+    SpanRegistry,
+)
+import lmcache.v1.mp_observability.subscribers.tracing.cb_server as cb_server_module
+
+
+@pytest.fixture
+def bus():
+    return EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+
+
+@pytest.fixture
+def registry():
+    return SpanRegistry()
+
+
+@pytest.fixture
+def subscriber(registry, bus):
+    sub = BlendTracingSubscriber(registry)
+    bus.register_subscriber(sub)
+    return sub
+
+
+class TestBlendTracingSubscriber:
+    def test_subscriptions_cover_all_cb_events(self, subscriber):
+        subs = subscriber.get_subscriptions()
+        assert EventType.CB_REQUEST_START in subs
+        assert EventType.CB_REQUEST_END in subs
+        assert EventType.CB_RETRIEVE_SUBMITTED in subs
+        assert EventType.CB_LOOKUP_START in subs
+        assert EventType.CB_LOOKUP_END in subs
+        assert EventType.CB_RETRIEVE_START in subs
+        assert EventType.CB_RETRIEVE_END in subs
+        assert EventType.CB_FINGERPRINTS_REGISTERED in subs
+        assert EventType.CB_CHUNKS_EVICTED in subs
+
+    # ------------------------------------------------------------------
+    # Root span creation
+    # ------------------------------------------------------------------
+
+    def test_root_span_created_on_request_start(self, bus, registry, subscriber):
+        bus.start()
+        bus.publish(Event(event_type=EventType.CB_REQUEST_START, session_id="req-root"))
+        time.sleep(0.15)
+        assert registry.get("req-root", "cb.request") is not None
+        bus.stop()
+
+    def test_no_root_span_before_any_event(self, registry):
+        assert registry.get("any-session", "cb.request") is None
+
+    # ------------------------------------------------------------------
+    # Session end closes root immediately when no GPU ops in flight
+    # ------------------------------------------------------------------
+
+    def test_session_end_closes_root_immediately_when_no_gpu_ops(
+        self, bus, registry, subscriber
+    ):
+        bus.start()
+        now = time.time()
+        sid = "req-lookup-only"
+
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_START,
+                session_id=sid,
+                timestamp=now,
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_START,
+                session_id=sid,
+                timestamp=now + 0.001,
+                metadata={"num_tokens": 64},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_END,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={
+                    "num_tokens": 64,
+                    "fingerprint_hits": 2,
+                    "storage_hits": 2,
+                    "stale_chunks": 0,
+                    "no_gpu_context": False,
+                },
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.020,
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+        assert registry.get(sid, "cb.request") is None
+        assert sid not in subscriber._pending_gpu_ops
+        assert len(subscriber._pending) == 0
+
+    # ------------------------------------------------------------------
+    # Deferred close: SESSION_END races GPU retrieve
+    # ------------------------------------------------------------------
+
+    def test_session_end_deferred_until_retrieve_finishes(
+        self, bus, registry, subscriber
+    ):
+        bus.start()
+        now = time.time()
+        sid = "req-deferred-retrieve"
+
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_START,
+                session_id=sid,
+                timestamp=now,
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_RETRIEVE_SUBMITTED,
+                session_id=sid,
+                timestamp=now + 0.001,
+                metadata={"instance_id": 1},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.005,
+            )
+        )
+        time.sleep(0.15)
+
+        assert registry.get(sid, "cb.request") is not None
+        assert sid in subscriber._deferred_session_end_ts
+
+        bus.publish(
+            Event(
+                event_type=EventType.CB_RETRIEVE_START,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={"instance_id": 1, "num_chunks": 3},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_RETRIEVE_END,
+                session_id=sid,
+                timestamp=now + 0.050,
+                metadata={"instance_id": 1, "num_chunks": 3, "success": True},
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+        assert registry.get(sid, "cb.request") is None
+        assert sid not in subscriber._deferred_session_end_ts
+        assert sid not in subscriber._pending_gpu_ops
+
+    # ------------------------------------------------------------------
+    # Child span lifecycles
+    # ------------------------------------------------------------------
+
+    def test_lookup_span_lifecycle(self, bus, subscriber):
+        bus.start()
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_START,
+                session_id="req-lookup",
+                metadata={"num_tokens": 128},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_END,
+                session_id="req-lookup",
+                metadata={
+                    "num_tokens": 128,
+                    "fingerprint_hits": 3,
+                    "storage_hits": 2,
+                    "stale_chunks": 1,
+                    "no_gpu_context": False,
+                },
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+        assert len(subscriber._pending) == 0
+
+    def test_retrieve_span_lifecycle(self, bus, subscriber):
+        bus.start()
+        bus.publish(
+            Event(
+                event_type=EventType.CB_RETRIEVE_START,
+                session_id="req-ret",
+                metadata={"instance_id": 1, "num_chunks": 3},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_RETRIEVE_END,
+                session_id="req-ret",
+                metadata={"instance_id": 1, "num_chunks": 3, "success": True},
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+        assert len(subscriber._pending) == 0
+
+    # ------------------------------------------------------------------
+    # Point events
+    # ------------------------------------------------------------------
+
+    def test_fingerprints_registered_no_crash(self, bus, subscriber):
+        bus.start()
+        bus.publish(
+            Event(
+                event_type=EventType.CB_FINGERPRINTS_REGISTERED,
+                session_id="req-fp",
+                metadata={"num_chunks": 8, "num_tokens": 256},
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+    def test_chunks_evicted_no_crash(self, bus, subscriber):
+        bus.start()
+        bus.publish(
+            Event(
+                event_type=EventType.CB_CHUNKS_EVICTED,
+                session_id="req-ev",
+                metadata={"num_chunks": 2},
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+    # ------------------------------------------------------------------
+    # Error resilience
+    # ------------------------------------------------------------------
+
+    def test_unmatched_end_does_not_crash(self, bus, subscriber):
+        bus.start()
+        bus.publish(
+            Event(
+                event_type=EventType.CB_RETRIEVE_END,
+                session_id="orphan",
+                metadata={"instance_id": 0, "num_chunks": 2, "success": True},
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+        assert len(subscriber._pending) == 0
+
+    def test_unmatched_start_cleaned_on_shutdown(self, bus, subscriber):
+        bus.start()
+        bus.publish(
+            Event(
+                event_type=EventType.CB_RETRIEVE_START,
+                session_id="leaked",
+                metadata={"instance_id": 0, "num_chunks": 4},
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+        subscriber.shutdown()
+        assert len(subscriber._pending) == 0
+
+    def test_multiple_concurrent_sessions(self, bus, subscriber):
+        bus.start()
+        for i in range(5):
+            bus.publish(
+                Event(
+                    event_type=EventType.CB_LOOKUP_START,
+                    session_id=f"req-{i}",
+                    metadata={"num_tokens": 100},
+                )
+            )
+        for i in range(5):
+            bus.publish(
+                Event(
+                    event_type=EventType.CB_LOOKUP_END,
+                    session_id=f"req-{i}",
+                    metadata={
+                        "num_tokens": 100,
+                        "fingerprint_hits": 2,
+                        "storage_hits": 2,
+                        "stale_chunks": 0,
+                        "no_gpu_context": False,
+                    },
+                )
+            )
+        time.sleep(0.15)
+        bus.stop()
+        assert len(subscriber._pending) == 0
+
+
+class TestCBHitRateAttributes:
+    """Verify hit_tokens / requested_tokens / hit_rate are set on cb.request root span.
+
+    Uses a real OTel TracerProvider backed by InMemorySpanExporter so that span
+    attributes are actually recorded.  The module-level ``_tracer`` is patched
+    for the duration of each test; ``_HAS_OTEL`` is forced True.
+    """
+
+    @pytest.fixture
+    def exporter(self):
+        """Real OTel provider with in-memory exporter; patches module tracer."""
+        exp = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exp))
+        real_tracer = provider.get_tracer("lmcache_mp.blend")
+        with (
+            patch.object(cb_server_module, "_tracer", real_tracer),
+            patch.object(cb_server_module, "_HAS_OTEL", True),
+        ):
+            yield exp
+        exp.shutdown()
+
+    def _root_span(self, exporter: InMemorySpanExporter, sid: str):
+        """Return the finished cb.request root span for *sid*, or None."""
+        for span in exporter.get_finished_spans():
+            if span.name == "cb.request" and span.attributes.get("session_id") == sid:
+                return span
+        return None
+
+    def test_hit_rate_attrs_set_on_root_span(self, exporter):
+        """CB_LOOKUP_END with hit_tokens=512, requested_tokens=1024 → hit_rate=0.5."""
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        registry = SpanRegistry()
+        bus.register_subscriber(BlendTracingSubscriber(registry))
+        bus.start()
+        now = time.time()
+        sid = "cb-hr-normal"
+
+        bus.publish(
+            Event(event_type=EventType.CB_REQUEST_START, session_id=sid, timestamp=now)
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_START,
+                session_id=sid,
+                timestamp=now + 0.001,
+                metadata={"num_tokens": 1024},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_END,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={
+                    "num_tokens": 1024,
+                    "fingerprint_hits": 4,
+                    "storage_hits": 2,
+                    "stale_chunks": 0,
+                    "no_gpu_context": False,
+                    "hit_tokens": 512,
+                    "requested_tokens": 1024,
+                },
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.020,
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+        root = self._root_span(exporter, sid)
+        assert root is not None
+        assert root.attributes["hit_tokens"] == 512
+        assert root.attributes["requested_tokens"] == 1024
+        assert abs(root.attributes["hit_rate"] - 0.5) < 1e-9
+
+    def test_hit_rate_zero_when_requested_tokens_is_zero(self, exporter):
+        """CB_LOOKUP_END with requested_tokens=0 yields hit_rate=0.0 without error."""
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        registry = SpanRegistry()
+        bus.register_subscriber(BlendTracingSubscriber(registry))
+        bus.start()
+        now = time.time()
+        sid = "cb-hr-zero"
+
+        bus.publish(
+            Event(event_type=EventType.CB_REQUEST_START, session_id=sid, timestamp=now)
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_START,
+                session_id=sid,
+                timestamp=now + 0.001,
+                metadata={"num_tokens": 0},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_END,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={
+                    "num_tokens": 0,
+                    "fingerprint_hits": 0,
+                    "storage_hits": 0,
+                    "stale_chunks": 0,
+                    "no_gpu_context": False,
+                    "hit_tokens": 0,
+                    "requested_tokens": 0,
+                },
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.020,
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+        root = self._root_span(exporter, sid)
+        assert root is not None
+        assert root.attributes["hit_tokens"] == 0
+        assert root.attributes["requested_tokens"] == 0
+        assert root.attributes["hit_rate"] == 0.0
+
+    def test_total_miss_hit_rate(self, exporter):
+        """CB_LOOKUP_END with storage_hits=0 but requested_tokens>0 → hit_rate=0.0."""
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        registry = SpanRegistry()
+        bus.register_subscriber(BlendTracingSubscriber(registry))
+        bus.start()
+        now = time.time()
+        sid = "cb-hr-miss"
+
+        bus.publish(
+            Event(event_type=EventType.CB_REQUEST_START, session_id=sid, timestamp=now)
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_START,
+                session_id=sid,
+                timestamp=now + 0.001,
+                metadata={"num_tokens": 1024},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_END,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={
+                    "num_tokens": 1024,
+                    "fingerprint_hits": 0,
+                    "storage_hits": 0,
+                    "stale_chunks": 0,
+                    "no_gpu_context": False,
+                    "hit_tokens": 0,
+                    "requested_tokens": 1024,
+                },
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.020,
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+        root = self._root_span(exporter, sid)
+        assert root is not None
+        assert root.attributes["hit_tokens"] == 0
+        assert root.attributes["requested_tokens"] == 1024
+        assert root.attributes["hit_rate"] == 0.0
+
+    def test_prefix_hits_attr_set_on_root_span(self, exporter):
+        """CB_LOOKUP_END with prefix_hits=2 stamps prefix_hits=2 on root span."""
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        registry = SpanRegistry()
+        bus.register_subscriber(BlendTracingSubscriber(registry))
+        bus.start()
+        now = time.time()
+        sid = "cb-prefix-hits"
+
+        bus.publish(
+            Event(event_type=EventType.CB_REQUEST_START, session_id=sid, timestamp=now)
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_START,
+                session_id=sid,
+                timestamp=now + 0.001,
+                metadata={"num_tokens": 512},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_END,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={
+                    "num_tokens": 512,
+                    "fingerprint_hits": 0,
+                    "prefix_hits": 2,
+                    "storage_hits": 2,
+                    "stale_chunks": 0,
+                    "no_gpu_context": False,
+                    "hit_tokens": 512,
+                    "requested_tokens": 512,
+                },
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.020,
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+        root = self._root_span(exporter, sid)
+        assert root is not None
+        assert root.attributes["prefix_hits"] == 2
+        assert root.attributes["hit_tokens"] == 512
+        assert root.attributes["hit_rate"] == 1.0
+
+    def test_prefix_hits_defaults_to_zero_when_absent(self, exporter):
+        """CB_LOOKUP_END without prefix_hits stamps prefix_hits=0 (backward compat)."""
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        registry = SpanRegistry()
+        bus.register_subscriber(BlendTracingSubscriber(registry))
+        bus.start()
+        now = time.time()
+        sid = "cb-prefix-absent"
+
+        bus.publish(
+            Event(event_type=EventType.CB_REQUEST_START, session_id=sid, timestamp=now)
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_START,
+                session_id=sid,
+                timestamp=now + 0.001,
+                metadata={"num_tokens": 256},
+            )
+        )
+        # Omit prefix_hits to simulate an older server payload
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_END,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={
+                    "num_tokens": 256,
+                    "fingerprint_hits": 1,
+                    "storage_hits": 1,
+                    "stale_chunks": 0,
+                    "no_gpu_context": False,
+                    "hit_tokens": 256,
+                    "requested_tokens": 256,
+                },
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.020,
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+        root = self._root_span(exporter, sid)
+        assert root is not None
+        assert root.attributes["prefix_hits"] == 0
+
+    def test_hit_rate_includes_prefix_and_non_prefix(self, exporter):
+        """Blend hit_rate numerator = prefix_hit_tokens + non_prefix_hit_tokens;
+        both are also recorded as separate attributes on the root span."""
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        bus.register_subscriber(BlendTracingSubscriber(SpanRegistry()))
+        bus.start()
+        now = time.time()
+        sid = "cb-hr-split"
+        bus.publish(
+            Event(event_type=EventType.CB_REQUEST_START, session_id=sid, timestamp=now)
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_START,
+                session_id=sid,
+                timestamp=now + 0.001,
+                metadata={"num_tokens": 1024},
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_LOOKUP_END,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={
+                    "prefix_hit_tokens": 256,
+                    "non_prefix_hit_tokens": 256,
+                    "hit_tokens": 512,  # = prefix + non_prefix
+                    "requested_tokens": 1024,
+                },
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.CB_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.011,
+            )
+        )
+        time.sleep(0.2)
+        bus.stop()
+
+        root = self._root_span(exporter, sid)
+        assert root is not None
+        assert root.attributes["prefix_hit_tokens"] == 256
+        assert root.attributes["non_prefix_hit_tokens"] == 256
+        assert root.attributes["hit_tokens"] == 512
+        assert root.attributes["hit_rate"] == 0.5
+
+
+class TestCBLookupSubspans:
+    """Blend lookup sub-spans (cb.fingerprint_match / cb.prefix_lookup /
+    cb.sparse_prefetch) nest under cb.lookup, not the cb.request root."""
+
+    @pytest.fixture
+    def exporter(self):
+        exp = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exp))
+        real_tracer = provider.get_tracer("lmcache_mp.blend")
+        with (
+            patch.object(cb_server_module, "_tracer", real_tracer),
+            patch.object(cb_server_module, "_HAS_OTEL", True),
+        ):
+            yield exp
+        exp.shutdown()
+
+    def _spans_by_name(self, exporter: InMemorySpanExporter, sid: str):
+        return {
+            s.name: s
+            for s in exporter.get_finished_spans()
+            if s.attributes.get("session_id") == sid
+        }
+
+    def test_lookup_subspans_nest_under_cb_lookup(self, exporter):
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        bus.register_subscriber(BlendTracingSubscriber(SpanRegistry()))
+        bus.start()
+        now = time.time()
+        sid = "cb-subspans"
+        seq = [
+            (EventType.CB_REQUEST_START, {}),
+            (EventType.CB_LOOKUP_START, {"num_tokens": 1024}),
+            (EventType.CB_PREFIX_LOOKUP_START, {}),
+            (EventType.CB_FINGERPRINT_MATCH_START, {}),
+            (EventType.CB_FINGERPRINT_MATCH_END, {"matches": 7}),
+            (EventType.CB_PREFIX_LOOKUP_END, {"prefix_chunks": 2}),
+            (EventType.CB_SPARSE_PREFETCH_START, {"n_chunks": 5}),
+            (EventType.CB_SPARSE_PREFETCH_END, {"found_keys": 5}),
+            (EventType.CB_LOOKUP_END, {"num_tokens": 1024, "prefix_chunks": 2}),
+            (EventType.CB_REQUEST_END, {}),
+        ]
+        for i, (et, md) in enumerate(seq):
+            bus.publish(
+                Event(
+                    event_type=et,
+                    session_id=sid,
+                    timestamp=now + i * 0.001,
+                    metadata=md,
+                )
+            )
+        time.sleep(0.3)
+        bus.stop()
+
+        spans = self._spans_by_name(exporter, sid)
+        for name in (
+            "cb.lookup",
+            "cb.fingerprint_match",
+            "cb.prefix_lookup",
+            "cb.sparse_prefetch",
+        ):
+            assert name in spans, f"missing span {name}; have {sorted(spans)}"
+        lookup_id = spans["cb.lookup"].context.span_id
+        for name in ("cb.fingerprint_match", "cb.prefix_lookup", "cb.sparse_prefetch"):
+            assert spans[name].parent is not None, f"{name} has no parent span"
+            assert spans[name].parent.span_id == lookup_id, (
+                f"{name} should nest under cb.lookup"
+            )
+        # cb.lookup itself nests under the cb.request root (unchanged behavior).
+        assert spans["cb.lookup"].parent.span_id == spans["cb.request"].context.span_id
+        # sub-span metadata propagates as attributes.
+        assert spans["cb.fingerprint_match"].attributes.get("matches") == "7"
+        # prefix coverage lands on both the prefix leg and cb.lookup.
+        assert spans["cb.prefix_lookup"].attributes.get("prefix_chunks") == "2"
+        assert spans["cb.lookup"].attributes.get("prefix_chunks") == "2"
+        assert spans["cb.sparse_prefetch"].attributes.get("found_keys") == "5"
+
+    def test_coordinator_match_span_nests_under_cb_lookup(self, exporter):
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        bus.register_subscriber(BlendTracingSubscriber(SpanRegistry()))
+        bus.start()
+        now = time.time()
+        sid = "cb-coord-match"
+        seq = [
+            (EventType.CB_REQUEST_START, {}),
+            (EventType.CB_LOOKUP_START, {"num_tokens": 1024}),
+            (EventType.CB_COORDINATOR_MATCH_START, {}),
+            (EventType.CB_COORDINATOR_MATCH_END, {"matches": 3, "timed_out": False}),
+            (EventType.CB_LOOKUP_END, {"num_tokens": 1024, "prefix_chunks": 2}),
+            (EventType.CB_REQUEST_END, {}),
+        ]
+        for i, (et, md) in enumerate(seq):
+            bus.publish(
+                Event(
+                    event_type=et,
+                    session_id=sid,
+                    timestamp=now + i * 0.001,
+                    metadata=md,
+                )
+            )
+        time.sleep(0.3)
+        bus.stop()
+
+        spans = self._spans_by_name(exporter, sid)
+        assert "cb.coordinator_match" in spans, (
+            f"missing cb.coordinator_match; have {sorted(spans)}"
+        )
+        assert (
+            spans["cb.coordinator_match"].parent.span_id
+            == spans["cb.lookup"].context.span_id
+        ), "cb.coordinator_match should nest under cb.lookup"
+        assert spans["cb.coordinator_match"].attributes.get("matches") == "3"
+        assert spans["cb.coordinator_match"].attributes.get("timed_out") == "False"
+
+    def test_scatter_span_nests_under_cb_retrieve(self, exporter):
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        bus.register_subscriber(BlendTracingSubscriber(SpanRegistry()))
+        bus.start()
+        now = time.time()
+        sid = "cb-scatter"
+        seq = [
+            (EventType.CB_REQUEST_START, {}),
+            (EventType.CB_RETRIEVE_START, {"num_chunks": 5}),
+            (
+                EventType.CB_SCATTER_START,
+                {
+                    "scattered_tokens": 1280,
+                    "n_prefix": 1,
+                    "n_shifted": 4,
+                    "dropped": 0,
+                },
+            ),
+            (EventType.CB_SCATTER_END, {}),
+            (EventType.CB_RETRIEVE_END, {}),
+            (EventType.CB_REQUEST_END, {}),
+        ]
+        for i, (et, md) in enumerate(seq):
+            bus.publish(
+                Event(
+                    event_type=et,
+                    session_id=sid,
+                    timestamp=now + i * 0.001,
+                    metadata=md,
+                )
+            )
+        time.sleep(0.3)
+        bus.stop()
+
+        spans = self._spans_by_name(exporter, sid)
+        assert "cb.scatter" in spans, f"missing cb.scatter; have {sorted(spans)}"
+        assert "cb.retrieve" in spans
+        assert (
+            spans["cb.scatter"].parent.span_id == spans["cb.retrieve"].context.span_id
+        ), "cb.scatter should nest under cb.retrieve"
+        assert spans["cb.scatter"].attributes.get("scattered_tokens") == "1280"
+        assert spans["cb.scatter"].attributes.get("n_shifted") == "4"
+        assert spans["cb.scatter"].attributes.get("dropped") == "0"
+
+
+class TestCBRootSpanClose:
+    """The blend module publishes CB_RETRIEVE_SUBMITTED and ends the request on
+    the last CB_RETRIEVE_END, so the root close is gated on in-flight GPU ops
+    alone."""
+
+    @pytest.fixture
+    def exporter(self):
+        exp = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exp))
+        real_tracer = provider.get_tracer("lmcache_mp.blend")
+        with (
+            patch.object(cb_server_module, "_tracer", real_tracer),
+            patch.object(cb_server_module, "_HAS_OTEL", True),
+        ):
+            yield exp
+        exp.shutdown()
+
+    def _root(self, exporter: InMemorySpanExporter, sid: str):
+        for span in exporter.get_finished_spans():
+            if span.name == "cb.request" and span.attributes.get("session_id") == sid:
+                return span
+        return None
+
+    def _start_bus(self):
+        """A running bus with only the tracing subscriber attached."""
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        bus.register_subscriber(BlendTracingSubscriber(SpanRegistry()))
+        bus.start()
+        return bus
+
+    def _drain(self, bus, sid, events):
+        """Publish ``(event_type, metadata)`` pairs and wait for the drain."""
+        for event_type, metadata in events:
+            bus.publish(Event(event_type=event_type, session_id=sid, metadata=metadata))
+        time.sleep(0.3)
+
+    def test_root_closes_after_retrieve_end(self, exporter):
+        """CB_REQUEST_END after the retrieve has ended closes the root."""
+        bus = self._start_bus()
+        sid = "cb-close"
+        self._drain(
+            bus,
+            sid,
+            [
+                (EventType.CB_REQUEST_START, {}),
+                (EventType.CB_RETRIEVE_SUBMITTED, {"instance_id": 0}),
+                (EventType.CB_RETRIEVE_START, {"num_chunks": 2}),
+                (EventType.CB_RETRIEVE_END, {"success": True}),
+                (EventType.CB_REQUEST_END, {}),
+            ],
+        )
+        bus.stop()
+
+        assert self._root(exporter, sid) is not None, "cb.request never closed"
+
+    def test_submitted_defers_close_until_retrieve_end(self, exporter):
+        """At TP>1 a no-op retrieve on one worker publishes CB_REQUEST_END on the
+        CPU while another worker's scatter is still on the stream — the root must
+        wait for CB_RETRIEVE_END."""
+        bus = self._start_bus()
+        sid = "cb-defer"
+        self._drain(
+            bus,
+            sid,
+            [
+                (EventType.CB_REQUEST_START, {}),
+                (EventType.CB_RETRIEVE_SUBMITTED, {"instance_id": 0}),
+                (EventType.CB_RETRIEVE_START, {"num_chunks": 2}),
+                # The other worker's no-op retrieve ends the request early.
+                (EventType.CB_REQUEST_END, {}),
+            ],
+        )
+
+        assert self._root(exporter, sid) is None, (
+            "root closed while a retrieve was live"
+        )
+
+        self._drain(bus, sid, [(EventType.CB_RETRIEVE_END, {"success": True})])
+        bus.stop()
+
+        assert self._root(exporter, sid) is not None
+
+    def test_retrieve_noop_emits_point_span_under_root(self, exporter):
+        bus = self._start_bus()
+        sid = "cb-noop-span"
+        self._drain(
+            bus,
+            sid,
+            [
+                (EventType.CB_REQUEST_START, {}),
+                (
+                    EventType.CB_RETRIEVE_NOOP,
+                    {"reason": "beyond_slot_bound", "dropped_matches": 4},
+                ),
+                (EventType.CB_REQUEST_END, {}),
+            ],
+        )
+        bus.stop()
+
+        spans = {
+            s.name: s
+            for s in exporter.get_finished_spans()
+            if s.attributes.get("session_id") == sid
+        }
+        assert "cb.retrieve.noop" in spans, f"have {sorted(spans)}"
+        noop = spans["cb.retrieve.noop"]
+        assert noop.attributes.get("reason") == "beyond_slot_bound"
+        assert noop.attributes.get("dropped_matches") == "4"
+        assert noop.parent.span_id == spans["cb.request"].context.span_id

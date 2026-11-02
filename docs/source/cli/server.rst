@@ -1,0 +1,130 @@
+lmcache server
+==============
+
+The ``lmcache server`` command launches the standalone LMCache
+Multi-Process (MP) server, which exposes a configurable ZMQ or gRPC request
+endpoint and an HTTP frontend (status, healthcheck, cache-clear, checksum
+APIs). It is the server that ``lmcache describe``, ``lmcache ping kvcache``,
+``lmcache kvcache``, and ``lmcache bench server`` talk to.
+
+.. note::
+
+   This command requires the full ``lmcache`` installation with CUDA
+   extensions. It is **not** available in the lightweight ``lmcache-cli``
+   package.
+
+.. code-block:: bash
+
+   lmcache server [options]
+
+Quick start
+-----------
+
+.. code-block:: bash
+
+   lmcache server \
+       --host 0.0.0.0 --port 5555 \
+       --l1-size-gb 100 \
+       --eviction-policy LRU
+
+Options
+-------
+
+The server composes its arguments from several configuration modules — the
+multiprocess server, the storage manager (L1 / L2 adapters / eviction), the
+HTTP frontend, and the Prometheus / telemetry observability layer. The full,
+authoritative list is large and evolves with the runtime, so consult:
+
+.. code-block:: bash
+
+   lmcache server --help
+
+Commonly used flags include:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Flag
+     - Description
+   * - ``--transport {zmq,grpc}``
+     - Request transport exposed by the server (default: ``zmq``).
+   * - ``--host HOST``
+     - Bind address for the server.
+   * - ``--port PORT``
+     - Request-transport port.
+   * - ``--chunk-size N``
+     - Minimum KV cache chunk size in tokens. The vLLM MP connector may
+       negotiate it upward; see :doc:`/mp/chunk_size_negotiation`.
+   * - ``--l1-size-gb GB``
+     - L1 (CPU/DRAM) cache capacity in GB.
+   * - ``--eviction-policy POLICY``
+     - L1 eviction policy (``LRU``, ``ARC``, ``IsolatedLRU``, or ``noop``).
+   * - ``--eviction-trigger-watermark RATIO``
+     - L1 fill ratio at which eviction begins.
+   * - ``--eviction-ratio RATIO``
+     - Fraction of L1 cleared per eviction cycle.
+   * - ``--max-workers N``
+     - Base number of request worker threads.
+   * - ``--grpc-server-workers N``
+     - gRPC dispatch threads (used only with ``--transport grpc``).
+   * - ``--grpc-server-mode {sync,aio,native}``
+     - gRPC server implementation (used only with ``--transport grpc``).
+       Default is ``sync``. ``native`` needs the ``pygrpc-native``
+       package.
+   * - ``--coordinator-url URL``
+     - Register with an MP coordinator at this base URL (e.g.
+       ``http://coordinator:9300``). Opt-in; enables fleet registration. See
+       :doc:`/mp/coordinator`.
+   * - ``--coordinator-advertise-ip IP``
+     - IP the coordinator should reach this server at (defaults to the
+       outbound IP).
+   * - ``--coordinator-heartbeat-interval SECONDS``
+     - Seconds between heartbeats (``> 0``, default ``5``). Keep well below the
+       coordinator's instance timeout.
+   * - ``--coordinator-event-reporting``
+     - Stream cache store/access/delete events to the coordinator, feeding the
+       key directory (fleet-wide placement tracking), L2 usage/quota tracking
+       and eviction, and the blend index behind fleet CacheBlend matching.
+   * - ``--coordinator-event-flush-interval SECONDS``
+     - Seconds between cache-event batch flushes (``> 0``, default ``1``).
+   * - ``--coordinator-event-transport {http,kafka}``
+     - Cache-event transport (default ``http``). ``kafka`` publishes each
+       batch to a Kafka topic instead of ``POST /events``; it needs the
+       optional ``lmcache[kafka]`` extra. See :doc:`/mp/coordinator`.
+   * - ``--coordinator-kafka-bootstrap-servers SERVERS``
+     - Comma-separated Kafka bootstrap servers. Required with
+       ``--coordinator-event-transport kafka``.
+   * - ``--coordinator-kafka-topic TOPIC``
+     - Kafka topic receiving cache events (default ``lmcache-cache-events``).
+   * - ``--coordinator-kafka-delivery-timeout SECONDS``
+     - Seconds the producer retries a record before dropping it (``> 0``,
+       default ``300``).
+   * - ``--p2p-advertise-url HOST:PORT``
+     - Enable P2P KV cache sharing and advertise this server's
+       transfer-channel endpoint to peers (e.g. ``10.0.0.1:8500``). Setting it
+       turns P2P on; it additionally requires ``--coordinator-url`` for peer
+       discovery. See :doc:`/mp/p2p`.
+   * - ``--p2p-listen-url HOST:PORT``
+     - Address the transfer-channel server binds to. Defaults to
+       ``--p2p-advertise-url``. Set it when the advertised address differs from
+       the bind address (e.g. bind ``0.0.0.0`` while advertising a routable IP).
+   * - ``--p2p-lookup-timeout SECONDS``
+     - Deadline for a peer lookup before it counts as a miss (default ``30``).
+   * - ``--p2p-load-timeout SECONDS``
+     - Deadline for a peer KV read before it counts as a failure
+       (default ``30``).
+   * - ``--p2p-transfer-engine ENGINE``
+     - Transfer-channel implementation for P2P reads (default ``nixl``).
+   * - ``--server-module JSON``
+     - Import out-of-tree ``DiscoverableModule`` classes. Repeatable.
+       See :doc:`/developer_guide/extending_lmcache/server_modules`.
+   * - ``--trace-level {storage,events}``
+     - Enable trace recording: ``storage`` records StorageManager calls for
+       replay, ``events`` records the cache-event stream emitted for the
+       coordinator, with or without one configured (see :doc:`trace`).
+   * - ``--trace-output PATH``
+     - Destination for recorded ``.lct`` trace files.
+
+L2 adapters, observability, and Prometheus exporters are configured through
+their own flag groups; see ``lmcache server --help`` for the complete set.

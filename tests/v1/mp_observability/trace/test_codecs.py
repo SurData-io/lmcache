@@ -1,0 +1,253 @@
+# SPDX-License-Identifier: Apache-2.0
+
+"""Round-trip tests for the trace codec registry."""
+
+# Third Party
+import pytest
+import torch
+
+# First Party
+from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
+    GroupedObjectKeys,
+    MemoryLayoutDesc,
+    MemoryResidency,
+    MemorySegment,
+    MemoryTags,
+    ObjectKey,
+    PrefetchHandle,
+    PrefetchLockMode,
+    PrefetchTaskSpec,
+)
+from lmcache.v1.mp_observability.trace import codecs
+
+
+def _roundtrip(v):
+    """Encode then decode through msgpack to mirror the recorder path."""
+    # Third Party
+    import msgspec
+
+    encoded = codecs.encode_value(v)
+    blob = msgspec.msgpack.encode(encoded)
+    decoded_msgpack = msgspec.msgpack.decode(blob)
+    return codecs.decode_value(decoded_msgpack)
+
+
+class TestPrimitives:
+    @pytest.mark.parametrize("v", [0, 1, -1, 3.14, "hi", b"bytes", True, False, None])
+    def test_passthrough(self, v):
+        assert _roundtrip(v) == v
+
+    def test_list(self):
+        assert _roundtrip([1, "a", None]) == [1, "a", None]
+
+    def test_dict(self):
+        assert _roundtrip({"a": 1, "b": [2, 3]}) == {"a": 1, "b": [2, 3]}
+
+    def test_tuple_preserved(self):
+        out = _roundtrip((1, 2, "x"))
+        assert out == (1, 2, "x")
+        assert isinstance(out, tuple)
+
+
+class TestObjectKey:
+    def test_roundtrip(self):
+        k = ObjectKey(chunk_hash=b"\x00\x01\x02", model_name="m", kv_rank=42)
+        out = _roundtrip(k)
+        assert out == k
+
+    def test_object_group_id_roundtrip(self):
+        k = ObjectKey(
+            chunk_hash=b"\x00\x01\x02",
+            model_name="m",
+            kv_rank=42,
+            object_group_id=7,
+        )
+        out = _roundtrip(k)
+        assert out == k
+        assert out.object_group_id == 7
+
+    def test_inside_list(self):
+        keys = [
+            ObjectKey(chunk_hash=b"a", model_name="m", kv_rank=1),
+            ObjectKey(chunk_hash=b"b", model_name="m", kv_rank=2),
+        ]
+        assert _roundtrip(keys) == keys
+
+
+class TestMemoryLayoutDesc:
+    def test_roundtrip(self):
+        d = MemoryLayoutDesc(
+            shapes=[torch.Size([2, 3]), torch.Size([4])],
+            dtypes=[torch.float16, torch.bfloat16],
+        )
+        out = _roundtrip(d)
+        assert out == d
+
+
+class TestPrefetchHandle:
+    def test_roundtrip(self):
+        h = PrefetchHandle(
+            prefetch_request_id=7,
+            external_request_id="req-1",
+            total_requested_keys=10,
+            submit_time=12345.6,
+            sliding_windows=(-1, 2),
+        )
+        out = _roundtrip(h)
+        assert out == h
+
+    def test_record_without_sliding_windows_decodes_to_empty(self):
+        """Handles recorded before windows were carried decode with none."""
+        encoded = codecs.encode_value(
+            PrefetchHandle(
+                prefetch_request_id=-1,
+                external_request_id="r",
+                total_requested_keys=3,
+                submit_time=0.0,
+            )
+        )
+        del encoded["v"]["sliding_windows"]
+        assert codecs.decode_value(encoded).sliding_windows == ()
+
+
+def _grouped_object_keys(gid: int, window: int = -1) -> GroupedObjectKeys:
+    return GroupedObjectKeys(
+        keys=[
+            ObjectKey(
+                chunk_hash=bytes([i]), model_name="m", kv_rank=1, object_group_id=gid
+            )
+            for i in range(3)
+        ],
+        object_group_id=gid,
+        layout_desc=MemoryLayoutDesc(
+            shapes=[torch.Size([2, 3])], dtypes=[torch.float16]
+        ),
+        sliding_window_size=window,
+    )
+
+
+class TestPrefetchLockMode:
+    def test_roundtrip(self):
+        for m in PrefetchLockMode:
+            assert _roundtrip(m) is m
+
+
+class TestGroupedObjectKeys:
+    def test_roundtrip(self):
+        g = _grouped_object_keys(2, window=4)
+        out = _roundtrip(g)
+        assert out == g
+        assert out.sliding_window_size == 4
+
+
+class TestPrefetchTaskSpec:
+    def test_roundtrip(self):
+        spec = PrefetchTaskSpec(
+            key_groups=[_grouped_object_keys(0), _grouped_object_keys(1, window=2)],
+            num_kv_readers=2,
+            fetching_policy="full",
+            lock_mode=PrefetchLockMode.NO_LOCK,
+        )
+        out = _roundtrip(spec)
+        assert out == spec
+        assert out.fetching_policy == "full"
+        assert out.lock_mode is PrefetchLockMode.NO_LOCK
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [
+            None,
+            frozenset(),
+            frozenset(
+                {
+                    MemoryTags(MemorySegment.DRAM, MemoryResidency.LOCAL),
+                    MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE),
+                }
+            ),
+        ],
+        ids=["all", "none", "some"],
+    )
+    def test_memory_tag_filters_roundtrip(self, allowed):
+        spec = PrefetchTaskSpec(
+            key_groups=[_grouped_object_keys(0)],
+            allowed_l1_memory_tags=allowed,
+            allowed_l2_memory_tags=allowed,
+        )
+        assert _roundtrip(spec) == spec
+
+
+class TestAttnWindowDesc:
+    def test_full_roundtrip(self):
+        out = _roundtrip(AttnWindowDesc(num_chunks_in_sw=[-1]))
+        assert out.num_chunks_in_sw == [-1]
+        assert out.is_full_attention(0)
+
+    def test_mixed_roundtrip(self):
+        out = _roundtrip(AttnWindowDesc(num_chunks_in_sw=[-1, 4, 1]))
+        assert out.num_chunks_in_sw == [-1, 4, 1]
+        assert out.is_full_attention(0)
+        assert not out.is_full_attention(1)
+        assert out.num_object_groups == 3
+
+    def test_world_size_roundtrip(self):
+        out = _roundtrip(AttnWindowDesc(num_chunks_in_sw=[-1, 4], world_size=4))
+        assert out.num_chunks_in_sw == [-1, 4]
+        assert out.world_size == 4
+
+    def test_empty_roundtrip(self):
+        out = _roundtrip(AttnWindowDesc(num_chunks_in_sw=[]))
+        assert out.num_chunks_in_sw == []
+        assert out.num_object_groups == 0
+
+
+class TestSet:
+    def test_roundtrip(self):
+        keys = {
+            ObjectKey(chunk_hash=b"a", model_name="m", kv_rank=1),
+            ObjectKey(chunk_hash=b"b", model_name="m", kv_rank=2),
+        }
+        out = _roundtrip(keys)
+        assert out == keys
+        assert isinstance(out, set)
+
+
+class TestTorchTypes:
+    def test_torch_size(self):
+        s = torch.Size([1, 2, 3])
+        out = _roundtrip(s)
+        assert isinstance(out, torch.Size)
+        assert tuple(out) == (1, 2, 3)
+
+    def test_torch_dtype(self):
+        for dt in [torch.float16, torch.bfloat16, torch.float32, torch.uint8]:
+            assert _roundtrip(dt) is dt
+
+
+class TestErrors:
+    def test_unknown_type_raises(self):
+        class Custom:
+            pass
+
+        with pytest.raises(TypeError, match="no codec"):
+            codecs.encode_value(Custom())
+
+    def test_unknown_tag_raises(self):
+        with pytest.raises(ValueError, match="unknown tag"):
+            codecs.decode_value({"__t__": "no-such-tag", "v": None})
+
+
+class TestEncodeArgs:
+    def test_args_dict(self):
+        args = {
+            "keys": [ObjectKey(chunk_hash=b"x", model_name="m", kv_rank=0)],
+            "mode": "new",
+            "num_kv_readers": 1,
+        }
+        encoded = codecs.encode_args(args)
+        # mode and num_kv_readers pass through; keys is wrapped.
+        assert encoded["mode"] == "new"
+        assert encoded["num_kv_readers"] == 1
+        assert isinstance(encoded["keys"], list)
+        decoded = codecs.decode_args(encoded)
+        assert decoded == args

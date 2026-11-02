@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Key-directory endpoints on the coordinator (fleet-level).
 
-The ``/directory`` surface, thin over the :class:`KeyDirectory` carried on
-the typed :class:`CoordinatorContext`: cache-event ingestion from MP
-servers, placement lookup, key/token-id listing, and stats. See
-``docs/design/v1/mp_coordinator/key_directory.md``.
+The ``/directory`` surface, thin over the :class:`KeyDirectory` carried
+on the typed :class:`CoordinatorContext`: placement lookup, fragment
+(blend) lookup, key/token-id listing, and stats — all read-only. The
+directory is written by the cache-event stream, which arrives on
+``POST /events`` (see :mod:`events_api`). See
+``docs/design/v1/mp_coordinator/views/key_directory.md``.
 """
 
 # Standard
@@ -15,51 +17,23 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 # First Party
 from lmcache.v1.distributed.api import Tier
+from lmcache.v1.mp_coordinator.api import BlendMatch, BlendNamespace
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
-from lmcache.v1.mp_coordinator.key_directory import ApplyResult, DirectoryStats
 from lmcache.v1.mp_coordinator.schemas import (
-    DirectoryEventsRequest,
-    DirectoryEventsResponse,
+    BlendLookupRequest,
+    BlendLookupResponse,
+    BlendMatchModel,
     DirectoryKeyInfo,
     DirectoryKeyPlacements,
     DirectoryListResponse,
     DirectoryLookupRequest,
     DirectoryLookupResponse,
+    decode_tokens,
 )
+from lmcache.v1.mp_coordinator.views.key_directory import DirectoryStats, KeyDirectory
 from lmcache.v1.multiprocess.cache_control.key_resolver import resolve_object_keys
 
 router = APIRouter()
-
-
-@router.post("/directory/events")
-async def report_cache_events(
-    body: DirectoryEventsRequest, request: Request
-) -> DirectoryEventsResponse:
-    """Apply a batch of cache-event batches to the key directory.
-
-    Batches are applied in list order; per instance they must be sent in
-    emission order. Duplicate and stale-incarnation batches are dropped
-    and counted, not errors. Applied batches also fan out to the
-    usage/eviction consumers via the context's event router.
-
-    Args:
-        body: The event batches to apply.
-
-    Returns:
-        Counts of applied and dropped batches.
-    """
-    ctx = get_context(request)
-    response = DirectoryEventsResponse()
-    for batch in body.batches:
-        result = ctx.key_directory.apply_batch(batch)
-        if result == ApplyResult.APPLIED:
-            ctx.event_broadcaster.broadcast(batch)
-            response.applied += 1
-        elif result == ApplyResult.DUPLICATE:
-            response.duplicates += 1
-        else:
-            response.stale += 1
-    return response
 
 
 @router.post("/directory/lookup")
@@ -80,14 +54,15 @@ async def lookup_placements(
 
     Returns:
         Chunk count plus one result per resolved key, in request order,
-        each with its known placements and the chunk's token ids
-        (both empty when the directory knows nothing about the key).
+        each with its known placements, the chunk's token ids, and the
+        key's access count. Unknown keys get empty lists and ``0``.
 
     Raises:
         HTTPException: 400 when the token sequence exceeds the
             per-request cap or a key field is invalid.
     """
     ctx = get_context(request)
+    directory = ctx.views.get(KeyDirectory)
     if body.keys:
         encoded_keys = list(body.keys)
         obj_keys = [encoded.to_object_key() for encoded in encoded_keys]
@@ -103,20 +78,93 @@ async def lookup_placements(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        obj_keys = directory.get_keys_across_object_groups(obj_keys)
         encoded_keys = [key.to_encoded_object_key() for key in obj_keys]
-    placements = ctx.key_directory.lookup(obj_keys)
-    token_ids = ctx.key_directory.get_token_ids([key.chunk_hash for key in obj_keys])
+    placements = directory.lookup(obj_keys)
+    keys_with_placements = [
+        key
+        for key, key_placements in zip(obj_keys, placements, strict=True)
+        if key_placements
+    ]
+    # By tokens, a chunk counts once across its ranks and object groups.
+    chunks_found = (
+        len(keys_with_placements)
+        if body.keys
+        else len({key.chunk_hash for key in keys_with_placements})
+    )
+    directory.record_lookup(
+        "prefix", chunks_requested=chunks, chunks_found=chunks_found
+    )
+    token_ids = directory.get_token_ids([key.chunk_hash for key in obj_keys])
+    access_counts = directory.get_access_counts(obj_keys)
     return DirectoryLookupResponse(
         chunks=chunks,
         results=[
             DirectoryKeyPlacements(
-                key=encoded, placements=key_placements, token_ids=list(tokens)
+                key=encoded,
+                placements=key_placements,
+                token_ids=list(tokens),
+                access_count=access_count,
             )
-            for encoded, key_placements, tokens in zip(
-                encoded_keys, placements, token_ids, strict=True
+            for encoded, key_placements, tokens, access_count in zip(
+                encoded_keys, placements, token_ids, access_counts, strict=True
             )
         ],
     )
+
+
+@router.post("/directory/blend-lookup")
+async def blend_lookup(
+    body: BlendLookupRequest, request: Request
+) -> BlendLookupResponse:
+    """Find cached chunk content anywhere inside a query sequence.
+
+    The fragment counterpart to ``/directory/lookup``: the query need not
+    be a prefix, and each match reports both where the content sits in
+    the query and where it sat when stored, so the caller can re-RoPE it.
+
+    Matches are restricted to the namespace the body names.
+
+    Args:
+        body: The query tokens and the caller's key-resolution
+            parameters.
+        request: The FastAPI request carrying the coordinator context.
+
+    Returns:
+        Matched chunks, ascending by query position.
+    """
+    ctx = get_context(request)
+    directory = ctx.views.get(KeyDirectory)
+    tokens = decode_tokens(body.tokens_b64)
+    namespace = BlendNamespace(
+        model_name=body.model_name,
+        cache_salt=body.cache_salt,
+        world_size=body.world_size,
+    )
+
+    chunk_size = ctx.token_hasher.chunk_size
+
+    def _match() -> BlendLookupResponse:
+        """Run the fragment match, count it, and shape it for the wire."""
+        matches = directory.blend_match(tokens, namespace)
+        directory.record_lookup(
+            "non_prefix",
+            chunks_requested=len(tokens) // chunk_size,
+            chunks_found=_covered_chunks(matches, chunk_size),
+        )
+        return BlendLookupResponse(
+            matches=[
+                BlendMatchModel(
+                    chunk_hash=match.chunk_hash.hex(),
+                    old_st=match.old_st,
+                    cur_st=match.cur_st,
+                )
+                for match in matches
+            ]
+        )
+
+    # The rolling hash walks the whole query — keep it off the event loop.
+    return await asyncio.to_thread(_match)
 
 
 @router.get("/directory/keys")
@@ -145,14 +193,16 @@ async def list_directory_keys(
 
     Returns:
         The number of keys matching the filters plus the requested page,
-        each key with its matching placements and the number of token
-        ids known for its chunk.
+        each key with its matching placements, the number of token ids
+        known for its chunk, and its access count.
     """
-    directory = get_context(request).key_directory
+    directory = get_context(request).views.get(KeyDirectory)
 
     def _scan() -> DirectoryListResponse:
+        """Page the directory and shape the rows for the wire."""
         total, page = directory.list_keys(tier, instance_id, backend, offset, limit)
         token_ids = directory.get_token_ids([key.chunk_hash for key in page])
+        access_counts = directory.get_access_counts(list(page))
         return DirectoryListResponse(
             total=total,
             keys=[
@@ -160,9 +210,10 @@ async def list_directory_keys(
                     key=key.to_encoded_object_key(),
                     placements=placements,
                     num_tokens=len(tokens),
+                    access_count=access_count,
                 )
-                for (key, placements), tokens in zip(
-                    page.items(), token_ids, strict=True
+                for (key, placements), tokens, access_count in zip(
+                    page.items(), token_ids, access_counts, strict=True
                 )
             ],
         )
@@ -176,7 +227,35 @@ async def directory_stats(request: Request) -> DirectoryStats:
     """Return a point-in-time summary of directory contents.
 
     Returns:
-        Key/placement counts plus per-instance stream state (incarnation,
-        last applied seq, gap flag), keyed by ``instance_id``.
+        Key/placement counts, per-instance L1 key counts, and the
+        blend-index counts. Per-emitter stream state (incarnation,
+        applied seq, gap flag) lives on the ingest gate and is not
+        exposed yet.
     """
-    return get_context(request).key_directory.stats()
+    return get_context(request).views.get(KeyDirectory).stats()
+
+
+def _covered_chunks(matches: list[BlendMatch], chunk_size: int) -> int:
+    """Return how many chunks' worth of the query the matches cover.
+
+    Matches can overlap in the query (two stored chunks sharing tokens), so
+    their count can exceed the chunks the query holds; the tokens they
+    cover together, overlaps counted once, cannot.
+
+    Args:
+        matches: Matches in ascending ``cur_st`` order, each covering
+            ``chunk_size`` query tokens from ``cur_st``.
+        chunk_size: Tokens per chunk.
+
+    Returns:
+        Covered query tokens divided by ``chunk_size``, rounded down.
+    """
+    covered_tokens = 0
+    covered_until = 0
+    for match in matches:
+        start = max(match.cur_st, covered_until)
+        end = match.cur_st + chunk_size
+        if end > start:
+            covered_tokens += end - start
+            covered_until = end
+    return covered_tokens // chunk_size

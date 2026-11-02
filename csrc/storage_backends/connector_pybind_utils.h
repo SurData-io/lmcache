@@ -44,10 +44,7 @@ example usage (see `redis/pybind.cpp`):
       .def("drain_completions",                                        \
            lmcache::connector::pybind_utils::bind_drain_completions<   \
                ConnectorType>())                                       \
-      .def("close", [](ConnectorType& self) {                          \
-        py::gil_scoped_release release;                                \
-        self.close();                                                  \
-      })
+      .def("close", &ConnectorType::close)
 
 template <typename ConnectorType>
 auto bind_submit_batch_get() {

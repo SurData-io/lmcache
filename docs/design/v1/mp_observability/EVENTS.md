@@ -1,0 +1,425 @@
+# Event Metadata Contracts
+
+Each `EventType` has a documented metadata schema.  Producers **must** populate
+these keys; subscribers **may** rely on them being present.
+
+For the full list of event types see `event.py`.  For metrics derived from
+these events see [METRICS.md](METRICS.md).
+
+---
+
+## BaseL1Manager Events
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `L1_READ_RESERVED` | `keys` | `list[ObjectKey]` |
+| `L1_READ_FINISHED` | `keys` | `list[ObjectKey]` |
+| `L1_WRITE_RESERVED` | `keys`, `tag` | `list[ObjectKey]`, `str` |
+| `L1_WRITE_FINISHED` | `keys` | `list[ObjectKey]` |
+| `L1_WRITE_FINISHED_AND_READ_RESERVED` | `keys` | `list[ObjectKey]` |
+| `L1_KEYS_EVICTED` | `keys` | `list[ObjectKey]` |
+| `L1_EVICTION_LOOP_TICK` | `usage`, `watermark`, `triggered` | `float`, `float`, `bool` |
+
+`L1_WRITE_RESERVED.tag` names the writer that staged the keys (e.g.
+`prefetch:<request_id>`, `storage_manager`); see
+`../distributed/l1_manager/staging-and-write-tags.md`. A staging object that is discarded or
+reclaimed without becoming resident publishes **no** event (it is logged at
+debug level): `L1_KEYS_EVICTED` is reserved for admitted objects, which is
+what the coordinator cache-event reporter and the L1 byte metrics assume.
+
+`L1_EVICTION_LOOP_TICK` fires once per `L1EvictionController.eviction_loop`
+iteration (default ~1Hz).  `triggered` is `True` when `usage >= watermark`
+and the policy ran this cycle, `False` otherwise.
+
+---
+
+## L1 Failure Events
+
+Published at the caller of the L1 API — **not** inside `BaseL1Manager` — so the
+caller context (`during`) can be attached without leaking caller identity
+into the manager. See LM-291 for the health-monitoring rationale.
+
+Producers split keys by `(during[, reason])` and publish one event per
+non-empty bucket; `keys` is the list of ObjectKeys that failed for that
+bucket. Subscribers bucket by `ObjectKey.model_name` to emit per-model
+counter increments.
+
+| EventType | Metadata keys | Types | Vocabulary |
+|---|---|---|---|
+| `L1_ALLOCATION_FAILED` | `during`, `keys` | `str`, `list[ObjectKey]` | `during` ∈ {`l1_store`, `l2_prefetch`} |
+| `L1_READ_FAILED` | `during`, `reason`, `keys` | `str`, `str`, `list[ObjectKey]` | `during` ∈ {`l2_store`, `l1_retrieve`}; `reason` ∈ {`not_found`, `write_locked`} |
+
+`L1_READ_FAILED` is a **post-lookup anomaly** event, not a cache-miss
+event: in MP mode every `reserve_read` / `unsafe_read` that raises one of
+these errors represents a lookup/reserve race or unexpected eviction. The
+counter should stay near zero in healthy operation.
+
+Producers:
+- `L1_ALLOCATION_FAILED(during=l1_store)` — `StorageManager.reserve_write`, on `L1Error.OUT_OF_MEMORY`.
+- `L1_ALLOCATION_FAILED(during=l2_prefetch)` — `PrefetchController._transition_to_load_phase`, on `L1Error.OUT_OF_MEMORY` from L1 reservation.
+- `L1_READ_FAILED(during=l1_retrieve)` — `StorageManager.read_prefetched_results` (`unsafe_read` failure). `not_found` = `KEY_NOT_EXIST`, `write_locked` = `KEY_NOT_READABLE` (read lock lost).
+- `L1_READ_FAILED(during=l2_store)` — `StoreController._process_new_keys` (`reserve_read` failure on keys that just finished L1 write). `not_found` = `KEY_NOT_EXIST`, `write_locked` = `KEY_NOT_READABLE`.
+
+---
+
+## StorageManager Events
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `SM_READ_PREFETCHED_FINISHED` | `succeeded_keys`, `failed_keys` | `list[ObjectKey]`, `list[ObjectKey]` |
+| `SM_WRITE_RESERVED` | `succeeded_keys`, `failed_keys` | `list[ObjectKey]`, `list[ObjectKey]` |
+| `SM_WRITE_FINISHED` | `succeeded_keys`, `failed_keys` | `list[ObjectKey]`, `list[ObjectKey]` |
+| `SM_CAPACITY_CHANGED` | `snapshot` | `CapacitySnapshot` |
+
+`SM_CAPACITY_CHANGED` carries a whole L1/L2 capacity snapshot, not a delta, and
+is emitted on registration and capacity-changing reconfiguration.
+
+---
+
+## L2 Store Controller Events
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `L2_STORE_SUBMITTED` | `adapter_index`, `task_id`, `l2_name`, `key_count`, `total_bytes`, `key_count_per_salt` | `int`, `int`, `str`, `int`, `int`, `dict[str, int]` |
+| `L2_STORE_COMPLETED` | `adapter_index`, `task_id`, `l2_name`, `bytes_transferred`, `succeeded_count`, `failed_count`, `key_count_per_salt` | `int`, `int`, `str`, `int`, `int`, `int`, `dict[str, int]` |
+
+`key_count_per_salt` maps each `cache_salt` to its key count, pre-grouped
+at the emit site so the drain thread iterates tenants (O(T)) not keys (O(N)).
+Store tasks can batch keys from multiple tenants; `key_count_per_salt`
+enables per-tenant attribution on the subscriber side.
+On the failure path of `L2_STORE_COMPLETED`, `key_count_per_salt` is absent
+(no succeeded keys to attribute).
+
+---
+
+## L2 Prefetch Controller Events
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `L2_PREFETCH_LOOKUP_SUBMITTED` | `request_id`, `key_count`, `adapter_count`, `key_count_per_salt` | `int`, `int`, `int`, `dict[str, int]` |
+| `L2_PREFETCH_LOAD_SUBMITTED` | `request_id`, `key_count`, `adapter_count`, `key_count_per_salt` | `int`, `int`, `int`, `dict[str, int]` |
+| `L2_PREFETCH_LOAD_COMPLETED` | `request_id`, `loaded_count`, `failed_count`, `key_count_per_salt` | `int`, `int`, `int`, `dict[str, int]` |
+| `L2_LOAD_TASK_SUBMITTED` | `request_id`, `adapter_index`, `task_id`, `l2_name`, `key_count`, `total_bytes` | `int`, `int`, `int`, `str`, `int`, `int` |
+| `L2_LOAD_TASK_COMPLETED` | `request_id`, `adapter_index`, `task_id`, `l2_name` | `int`, `int`, `int`, `str` |
+
+`key_count_per_salt` on `L2_PREFETCH_LOOKUP_SUBMITTED`,
+`L2_PREFETCH_LOAD_SUBMITTED`, and `L2_PREFETCH_LOAD_COMPLETED` enables
+per-tenant metric attribution. `key_count_per_salt` on load-completed
+covers only loaded (succeeded) keys.
+
+`L2_LOAD_TASK_*` events fire once per `(request_id, adapter_index)` pair
+— unlike the request-level `L2_PREFETCH_LOAD_*` events above, which
+aggregate across adapters.  Throughput subscribers that need per-adapter
+attribution (e.g. `L2ThroughputSubscriber`) consume these task-level
+events; key-count counters continue to consume the request-level events.
+
+---
+
+## L2 Eviction Controller Events
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `L2_KEYS_EVICTED` | `key_count`, `key_count_per_salt` | `int`, `dict[str, int]` |
+
+Published by `L2EvictionController._execute_eviction_action` after
+`adapter.delete()` completes. Only emitted when at least one key was
+evicted. `key_count_per_salt` enables per-tenant eviction dashboards.
+
+---
+
+## L2 Failure Events
+
+Health-monitoring event for the L2 prefetch path. See LM-291.
+
+| EventType | Metadata keys | Types | Vocabulary |
+|---|---|---|---|
+| `L2_PREFETCH_FAILED` | `reason`, `keys` | `str`, `list[ObjectKey]` | `reason` ∈ {`l1_oom`, `l1_contended`, `not_found`} |
+
+Producers (all in `PrefetchController`):
+- `reason=l1_oom` — emitted when `reserve_write` of a load's L1 staging buffer returns `OUT_OF_MEMORY`. The affected cells drop their L2 lock and the request is re-planned on what was reserved.
+- `reason=l1_contended` — emitted when `reserve_write` returns `KEY_NOT_WRITABLE` because the key became resident in L1 between the lookup and the reserve step. The cell is treated like an out-of-memory cell.
+- `reason=not_found` — emitted in `_poll_load_results` for keys reserved in L1 but missing from the adapter's load bitmap (L2 reported the key present at lookup but produced no data).
+
+The third reason `serde_failure` will be added as an additive, non-breaking
+extension once the serde PR lands and adapters can distinguish
+deserialization errors from missing objects. No dashboard migration
+needed when that happens.
+
+---
+
+## Timeout Events
+
+Cross-component health event. Published by `LMCacheTimeoutError.__init__`
+(see `lmcache/v1/mp_observability/errors.py`) every time the exception is
+constructed, gated by `is_observability_enabled()` so it is a no-op outside
+the MP server process. The `session_id` on the `Event` dataclass correlates
+the timeout with the originating request when the raise site has it; it is
+empty otherwise.
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `TIMEOUT_RAISED` | `message`, `exception_type`, `stacktrace` | `str`, `str`, `str` |
+
+- `message` — the exception's message string (`str(exc)`).
+- `exception_type` — the class name (`LMCacheTimeoutError` or a subclass).
+- `stacktrace` — the formatted construction stack (`traceback.format_stack()`
+  minus the `__init__` frame), surfaced as the OTel `exception.stacktrace`
+  attribute by the tracing subscriber.
+
+Consumed by `TimeoutMetricsSubscriber` (counter), `TimeoutLoggingSubscriber`
+(warning log), and `TimeoutTracingSubscriber` (OTel span with an `exception`
+event + ERROR status).
+
+---
+
+## MP Server Lifecycle Sentinels
+
+CPU-synchronous sentinels published by `server.py` to bracket request scope.
+Published via `EventBus.publish()` (not `publish_on_stream`) so the drain
+thread processes them in strict order before any GPU-callback events.
+
+| EventType | Metadata keys | Types | Published by / when |
+|---|---|---|---|
+| `MP_REQUEST_START` | *(none)* | — | `MPServer.handle_request` — at request arrival, before any GPU work |
+| `MP_STORE_SUBMITTED` | `device` | `str` | `MPServer.store` — CPU-synchronous, before the GPU store is enqueued |
+| `MP_RETRIEVE_SUBMITTED` | `device` | `str` | `MPServer.retrieve` — CPU-synchronous, before the GPU retrieve is enqueued |
+| `MP_REQUEST_END` | *(none)* | — | `MPServer.handle_request` — after all CPU work; may precede GPU callbacks |
+
+---
+
+## MP Server Events
+
+These events use `session_id` on the `Event` dataclass (not in `metadata`)
+to correlate START/END pairs.
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `MP_STORE_START` | `device`, `engine_id`, `model_name`, `transfer_key` | `str`, `int`, `str`, `str` |
+| `MP_STORE_END` | `device`, `stored_count`, `engine_id`, `model_name`, `total_bytes`, `num_tokens`, `transfer_key` | `str`, `int`, `int`, `str`, `int`, `int`, `str` |
+| `MP_TRANSFER_PHASE_SAMPLES` | `samples`, `ended_transfer_key` | `list[tuple[int, int, int, float, int, str, float, float]]` — `(phase, direction, device_index, elapsed_ms, nbytes, session_id, start_time_s, end_time_s)` per finished executor section, plus the `transfer_key` (`str`) of the transfer whose END published this event -- its authoritative completion signal, present even when `samples` is empty; `phase` is a `TransferPhase` value (0 = kernel, 1 = staging), `direction` a `TransferDirection` value, the `session_id` slot carries the `transfer_key` of the store/retrieve operation (see `next_transfer_key`), `start_time_s`/`end_time_s` its bounds on the EventRecorder wall clock (empty / `0.0` only if the call's anchor event could not be recorded) |
+| `MP_RETRIEVE_START` | `device`, `engine_id`, `model_name`, `transfer_key` | `str`, `int`, `str`, `str` |
+| `MP_RETRIEVE_END` | `device`, `retrieved_count`, `engine_id`, `model_name`, `cache_salt`, `total_bytes`, `num_tokens`, `transfer_key` | `str`, `int`, `int`, `str`, `str`, `int`, `int`, `str` |
+| `MP_LOOKUP_PREFETCH_START` | *(none)* | — |
+| `MP_LOOKUP_PREFETCH_END` | `found_count`, `requested_tokens`, `apc_covered_tokens`, `hit_tokens`, `l1_hit_tokens`, `l2_hit_tokens`, `l1_hit_keys`, `l2_hit_keys`, `prompt_tokens`, `engine_hit_tokens`, `request_hit_tokens`, `early_exit_reason`, `model_name`, `cache_salt` | `int`, `int`, `int`, `int`, `int`, `int`, `int`, `int`, `int`, `int`, `int`, `str`, `str`, `str` |
+| `MP_LOOKUP` | `request_id`, `chunk_hashes`, `model_name`, `chunk_size`, `seq_len`, `dtypes`, `shapes`, `token_ids` | `str`, `list[str]`, `str`, `int`, `int`, `list[str]`, `list[list[int]]`, `tuple[int, ...]` (the IPC key's prompt token ids, shared by reference) |
+| `MP_VLLM_BLOCK_ALLOCATION` | `instance_id`, `model_name`, `records` | `int`, `str`, `list[BlockAllocationRecord]` (each has `req_id: str`, `new_block_ids: list[int]`, `new_token_ids: list[int]`) |
+| `MP_VLLM_END_SESSION` | `request_id` | `str` |
+
+### `MP_TRANSFER_PHASE_SAMPLES`
+
+Published by `TransferPhaseSampler` while dispatching `MP_STORE_END` /
+`MP_RETRIEVE_END`: those are stream-published, so every section of the
+ending transfer has completed and `device_ops.pop_completed_phase_timings()`
+returns its full sample set (plus any other transfer's sections that have
+finished meanwhile). Each sample carries its own `session_id`,
+`device_index` and `direction`.
+
+Timing is on when the bus is enabled and this event has a subscriber
+(`EventBus.has_subscribers`), i.e. with metrics or tracing on. Besides the per-section event pairs the
+executor records one anchor event per call plus a host callback stamping the
+EventRecorder wall clock, which gives each sample its `session_id` and
+`start_time_s`/`end_time_s`. `TransferPhaseTracingSubscriber` folds them into
+per-transfer `transfer.kernel_interval` / `transfer.staging` child spans (see
+`docs/design/observability/request-event-span.md`, Example 3).
+
+### `num_tokens` on `MP_STORE_END` / `MP_RETRIEVE_END`
+
+Denormalized token count (`num_chunks * chunk_size`) so subscribers need
+not know `chunk_size`. For a store, `num_chunks` counts unique chunk positions
+for which at least one object group committed a new object; chunks that were
+already fully present are excluded. Fail-closed, matching `total_bytes`: `0`
+when the store committed nothing (`stored_count == 0`) or the retrieve did not
+fully succeed.
+
+### `MP_LOOKUP_PREFETCH_END` metadata
+
+`found_count` is the contiguous prefix hit at chunk granularity, already
+divided by `world_size` at the emit site.  It is absolute: when the lookup
+key's `start` skips an engine-covered prefix (see
+[apc_covered_lookup.md](../multiprocess/modules/apc_covered_lookup.md)), it
+includes the skipped chunks, because that is the hit the engine resolves.
+The token fields below do not.  `requested_tokens` and `hit_tokens` are
+denormalized token-level counts so subscribers need not know `chunk_size`:
+
+- `requested_tokens = len(chunk_hashes) * chunk_size - apc_covered_tokens`
+  on the happy path; `0` on the two early-exit paths in `lookup()` (no
+  matching GPU context, empty `chunk_hashes`).  Sub-chunk trailing tokens
+  are excluded — they cannot hit at chunk granularity.
+- `hit_tokens`: only the tokens the lookup actually found, past the
+  skipped prefix.
+- `apc_covered_tokens` is the APC-covered prefix LMCache was told to skip:
+  the key's `start`, as fixed when the lookup was submitted and rounded down
+  to `chunk_size`.  It is not the engine's exact APC hit at completion,
+  which may have grown or shrunk since.  LMCache never looks this prefix
+  up, so it is excluded from `requested_tokens` and from every hit field
+  (otherwise it would read as an L1 hit), and reported here instead.  `0`
+  when the key starts at `0` and on the early-exit paths; still reported
+  on a lookup the load policy declined.
+- `l1_hit_tokens` and `l2_hit_tokens` split `hit_tokens` by the tier that
+  served it.  `l1_hit_tokens` is the fold of `PrefetchResult.l1_hit_cells`
+  — the prefix L1 alone could serve under each object group's attention
+  window rule — so a chunk whose out-of-window keys were never fetched is
+  still an L1 hit.  `l2_hit_tokens` is the remainder: how much further
+  `found_count` reached once L2 completed.  **Invariant:
+  `l1_hit_tokens + l2_hit_tokens == hit_tokens`, exactly, on every path**,
+  so a dashboard summing the two can never exceed 100%.
+- `l1_hit_keys` and `l2_hit_keys` count the hit keys (one per object group,
+  kv rank and chunk) L1 already held and L2 loaded:
+  `PrefetchResult.l1_hit_count` and `l2_hit_count`.  They are not divided by
+  `world_size` and are `0` on the early-exit paths.  On hybrid models they
+  complement the token split: when L1 holds the full-attention keys but L2
+  serves the sliding-window keys, `l1_hit_tokens` is `0` while `l1_hit_keys`
+  is most of the hit.
+- `prompt_tokens`, `engine_hit_tokens` and `request_hit_tokens` are the
+  request-level view, reported on every path (early exits and declined
+  lookups included) because they describe the request, not the lookup:
+  - `prompt_tokens = num_packed_tokens(key.token_bytes)`: the whole prompt, sub-chunk tail
+    included, so a request-level rate uses the same denominator a user
+    would.
+  - `engine_hit_tokens`: the engine's own prefix-cache hit, read from the
+    `lmcache.hint.engine_computed_tokens` request config (see
+    [kv_load_policy.md](../multiprocess/kv_load_policy.md)).  Unlike
+    `apc_covered_tokens` it is not rounded down to a chunk boundary; `0`
+    when the integration sends no hint.
+  - `request_hit_tokens = max(engine_hit_tokens, apc_covered_tokens +
+    hit_tokens)`: the prefix of the prompt served by either cache.  Both
+    ranges start at token 0 and the lookup starts at or below the engine
+    hit, so the longer one is their union; summing them would double count
+    the sub-chunk gap between the raw engine hit and the aligned lookup
+    start.
+
+  It is a per-lookup snapshot of the request: a request that bypasses
+  LMCache never reaches the server, a request that looks up twice (APC
+  shrink, preemption) is counted twice, and the engine hit is the value at
+  submit time.
+- `early_exit_reason` names the branch of `lookup()` that returned before a
+  prefetch task was submitted.  Always present; `""` on the normal path.
+  Vocabulary:
+
+  | Value | Meaning | Operator action |
+  |---|---|---|
+  | `""` | Normal path (including a genuine cold miss) | None — inspect the hit rate |
+  | `no_gpu_context` | No layout registered for this model / world size | Configuration or registration bug; also logged at `error` |
+  | `empty_chunk_hashes` | Prompt shorter than one chunk | None — a workload property, not a cache failure |
+  | `no_group_layout_descs` | No per-object-group layouts registered for this model / world size | Configuration or registration bug; also logged at `error` |
+
+  Without it `found_count == 0` conflates a cold miss with every early
+  exit.  Extensions are additive: a new value may be added without a
+  dashboard migration, as with the `L2_PREFETCH_FAILED` `reason`
+  vocabulary.
+- `model_name` and `cache_salt` are captured at lookup time from
+  `IPCCacheServerKey` and surface as OTel attributes on the
+  `lmcache_mp.lookup_*_tokens` counters so the hit rate can be sliced
+  per model and per tenant / isolation domain on the dashboard.
+  `cache_salt` may have high cardinality (e.g. one entry per tenant);
+  operators can drop the label at scrape time with a `metric_relabel_configs`
+  rule if storage cost matters.
+
+Together they drive the `lmcache_mp.lookup_*_tokens` counters used to
+compute the L1+L2 token-level hit rate.  See
+[L1_L2_HIT_RATE_PLAN.md](L1_L2_HIT_RATE_PLAN.md) for the design.
+
+---
+
+## Trace Recording Events
+
+A single unified event used by the `@enable_tracing` decorator (see
+[trace.md](trace.md)). All instrumented call sites publish the same
+`EventType` regardless of which method or layer; the `qualname` field
+inside `metadata` discriminates ops.
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `TRACE_CALL` | `qualname`, `args` | `str`, `dict[str, Any]` (codec-encoded; see `lmcache.v1.mp_observability.trace.codecs`) |
+
+---
+
+## Blend Server Lifecycle Sentinels
+
+CPU-synchronous sentinels published by `modules/blend.py` (`BlendModule`) to
+bracket request scope and guard GPU callback races.  Published via
+`EventBus.publish()` (not `publish_on_stream`).
+
+| EventType | Metadata keys | Types | Published by / when |
+|---|---|---|---|
+| `CB_REQUEST_START` | *(none)* | — | `BlendModule.cb_unified_lookup` — first (submitting) call |
+| `CB_RETRIEVE_SUBMITTED` | `instance_id` | `int` | `BlendModule.cb_retrieve_pre_computed` — before GPU retrieve enqueue. Holds `cb.request` open across the scatter so a sibling TP worker's early `CB_REQUEST_END` cannot close the root; the root closes on the last `CB_RETRIEVE_END` |
+| `CB_REQUEST_END` | *(none)* | — | `BlendModule.cb_unified_lookup` when the finalized result carries nothing to retrieve (miss / prefix-only — no retrieve will follow), otherwise `BlendModule.cb_retrieve_pre_computed` on every exit (no-op success, read failure, exception, success — the last on the GPU stream) |
+
+---
+
+## Blend Server Events
+
+These events use `session_id` on the `Event` dataclass (sourced from
+`IPCCacheServerKey.request_id`) to correlate START/END pairs.
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `CB_LOOKUP_START` | `num_tokens` | `int` |
+| `CB_LOOKUP_END` | `num_tokens`, `requested_tokens`, `hit_tokens`, `fingerprint_hits`, `storage_hits`, `stale_chunks`, `no_gpu_context` | `int`, `int`, `int`, `int`, `int`, `int`, `bool` |
+| `CB_RETRIEVE_START` | `num_chunks`, `model_name`, `worker_id` | `int`, `str`, `int \| None` |
+| `CB_RETRIEVE_END` | `success`, `worker_id` | `bool`, `int \| None` |
+| `CB_FINGERPRINTS_REGISTERED` | `num_chunks`, `num_tokens` | `int`, `int` |
+| `CB_CHUNKS_EVICTED` | `num_chunks` | `int` |
+
+`CB_LOOKUP_END` also carries `prefix_hit_tokens`,
+`segmented_prefix_hit_tokens`, `non_prefix_hit_tokens`, `prefix_hits` and
+`prefix_chunks` (all `int`), with `hit_tokens` their sum.  A `no_gpu_context`
+lookup still reports the real `requested_tokens`, so such a request lands in
+the hit-rate denominator as a miss.
+
+`CB_FINGERPRINTS_REGISTERED` is published by the fingerprint-queue
+drainers from what `on_new_token_hashes` returned, so `num_chunks` counts only
+chunks *newly indexed*: it excludes the chunks the store skipped **and** chunks
+the matcher deduplicated (already registered by an earlier store); `num_tokens`
+is `num_chunks × chunk_size`.  A job that indexed nothing (a re-store of known
+content) publishes no event.  `session_id` is the enqueuing store's request —
+generally *not* the request that drained the queue.
+
+The retrieve and scatter events (`CB_RETRIEVE_START/END`,
+`CB_SCATTER_START/END`) also carry `worker_id` (`int | None`, the
+`IPCCacheServerKey.worker_id` of the calling rank).  At TP>1 every rank issues
+its own retrieve under the shared `request_id`, so a consumer that pairs
+START/END by `session_id` alone stitches one interval out of two ranks.  The
+metrics subscriber pairs on `(session_id, worker_id)`; the tracing subscriber
+still keys `cb.retrieve` / `cb.scatter` spans by session only (known follow-up
+— `worker_id` is on the events, so the fix is mechanical).  Two caveats for
+consumers: these events travel through `publish_on_stream`, whose native
+recorder carries non-`int` metadata as strings, so a `None` `worker_id` can
+arrive as the string `"None"` — treat any non-`int` value as "no worker".
+
+### Blend Server sub-phase events
+
+Published by `blend.py` around the legs of the unified lookup and the
+retrieve scatter, correlated by `session_id` (plus `worker_id` for the scatter
+pair, see above).  The scatter pair goes through `publish_on_stream`, so its
+timing is GPU-accurate.
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `CB_FINGERPRINT_MATCH_START` | *(none)* | — |
+| `CB_FINGERPRINT_MATCH_END` | `matches` | `int` |
+| `CB_PREFIX_LOOKUP_START` | *(none)* | — |
+| `CB_PREFIX_LOOKUP_END` | `prefix_chunks` | `int` |
+| `CB_COORDINATOR_MATCH_START` | *(none)* | — |
+| `CB_COORDINATOR_MATCH_END` | `matches`, `timed_out` | `int`, `bool` |
+| `CB_SPARSE_PREFETCH_START` | `n_chunks`, `world_size`, `n_keys`, `l2_keys` | `int`, `int`, `int`, `int` |
+| `CB_SPARSE_PREFETCH_END` | `found_keys`, `l2_keys` | `int`, `int` |
+| `CB_SCATTER_START` | `scattered_tokens`, `n_prefix`, `n_shifted`, `dropped`, `worker_id` | `int`, `int`, `int`, `int`, `int \| None` |
+| `CB_SCATTER_END` | `success`, `worker_id` | `bool`, `int \| None` |
+| `CB_RETRIEVE_NOOP` | `reason`, `dropped_matches` | `str`, `int` |
+
+Notes:
+
+- The fingerprint-match and coordinator-match legs are **mutually exclusive**:
+  with a coordinator configured the fleet directory is the only match source.
+  That leg is async — START at submit, END on the resolving poll or at its
+  deadline (`timed_out=True`).
+- The sparse-prefetch pair is emitted **only when the prefetch reads L2**
+  (`l2_keys > 0`).
+- `CB_RETRIEVE_NOOP` is a point event: the retrieve returned success without
+  scattering anything, so every match degrades to a full recompute.  `reason` is
+  a fixed code (`beyond_slot_bound`, `no_object_keys`), safe as a metric
+  attribute.  Not published when the no-op dropped nothing (ranges already
+  scattered by an earlier retrieve for this worker), so the event always means
+  reuse was lost.

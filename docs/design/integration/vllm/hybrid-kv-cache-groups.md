@@ -1,0 +1,244 @@
+# Hybrid KV Cache Groups
+
+## Summary
+
+Minimal hybrid memory allocator (HMA) design for the multiprocess vLLM
+connector. It separates three concepts:
+
+- **Engine KV cache group** — a group defined by the serving engine (vLLM's
+  `KVCacheConfig.kv_cache_groups`). Each is one distinct paged-block address
+  space; block IDs are only meaningful within one group.
+- **`EngineGroupInfo`** — LMCache's engine-neutral, `msgspec`-encoded record of
+  one such group (`group_view.py`). A `list[EngineGroupInfo]` is the
+  registration contract.
+- **`KVLayerGroupInfo`** — the server's runtime transfer-kernel dispatch unit,
+  built from the engine group infos + the real tensors (`kv_layer_groups.py`).
+
+vLLM groups layers by cache behavior; LMCache must transfer by the full
+physical identity `(kv_size, num_heads, head_size, block_size,
+engine_group_idx, dtype, engine_kv_format, block_stride_elems)`. This keeps
+distinct engine block-ID spaces and physical layouts separate. At registration
+we build engine group infos, and store/retrieve address those infos directly.
+
+## Goals / Non-Goals
+
+- Keep the request API engine-neutral; confine vLLM field reads to
+  `lmcache.integration.vllm`.
+- Registration defines the protocol-visible group order; store/retrieve block
+  IDs are indexed by that order.
+- Reuse one grouping primitive (`group_layers_by_identity`) on both the vLLM and
+  server sides so group order matches.
+- **Not** in scope: sliding-window load-plan trimming; HMA on the non-GPU
+  transfer path (it rejects multi-group); removing `layout_hints` (still used
+  for tensor layout). Per-group block *sizes*, cross-layer KV sharing, and
+  DeepSeek-V4-style slot compression (`compress_ratio > 1`, packing several
+  logical tokens per physical slot) *are* supported (see Store and retrieve).
+
+## Types
+
+- **`EngineGroupInfo`** (`msgspec.Struct`): `engine_group_id` (which engine
+  block group its layers live in; dense from 0) + `layer_indices` +
+  `tokens_per_block` (logical tokens covered by one of the group's paged
+  chunks, from the engine's KV cache spec `block_size`; `0` = unreported).
+  Several infos may share an `engine_group_id` when one engine group is split
+  by physical transfer identity. The list order is the protocol-visible group
+  order; an empty list means a single non-hybrid group.
+- Helpers in `group_view.py` operate on `Sequence[EngineGroupInfo]`:
+  `num_engine_groups`, `num_engine_group_infos`, `expand_engine_block_ids`,
+  `get_engine_group_indices`.
+- **`KVLayerGroupInfo`** (runtime, server-only): layer indices,
+  `PageBufferShapeDesc`, dtype, `tokens_per_block` / `slots_per_block`,
+  `slots_per_chunk`, `engine_group_idx`. Derived from real tensors — never the
+  API contract.
+
+## Data flow
+
+```text
+vLLM KVCacheConfig + registered kv_caches
+  | integration.vllm.kv_cache_groups.create_engine_group_infos_from_vllm
+  v
+list[EngineGroupInfo]  --REGISTER_KV_CACHE (msgspec)-->  server msgspec-decode
+  | KVLayerGroupsManager validates against real tensors
+  v
+KVLayerGroupInfo list   --STORE/RETRIEVE block_ids per info-->  transfer kernels
+```
+
+## Registration
+
+`create_engine_group_infos_from_vllm` (the only place that reads vLLM `KVCacheConfig`):
+
+1. Discover each layer's Engine KV format from its registered tensor
+   (`normalize_and_discover_per_layer_formats`). Detection is per *layout*, not
+   per engine group: a single engine group can contain layers whose registered
+   KV tensors have different shapes — for example a 5-D key+value cache
+   (`[NB, 2, BS, NH, HS]`, `kv_size=2`) alongside a 3-D key-only cache
+   (`[NB, BS, HS]`, `kv_size=1`) in one `UniformTypeKVCacheSpecs` group — so each
+   distinct layout within a group is detected and reported separately.
+   ("5-D"/"3-D" is the tensor rank: the number of dimensions of one layer's
+   registered KV tensor.)
+2. Map each registered layer to its engine group index; layers absent from
+   every group's `layer_names` (cross-layer KV-sharing layers) are tagged
+   `EXCLUDED_ENGINE_GROUP` and dropped (see Cross-layer KV sharing).
+3. `group_layers_by_identity` splits layers by transfer identity
+   `(kv_size, num_heads, head_size, block_size, engine_group_idx, dtype,
+   engine_kv_format, block_stride_elems)` — `engine_group_idx` keeps
+   identically-shaped layers from different engine groups in separate infos,
+   `engine_kv_format` keeps different layouts that share one engine group apart
+   (the 5-D key+value vs the 3-D key-only cache from step 1), and
+   `block_stride_elems` separates physically different block layouts.
+4. Emit one `EngineGroupInfo` per identity; send the list in the
+   `REGISTER_KV_CACHE` payload (the message queue encodes it).
+
+## Store and retrieve
+
+vLLM reports block IDs per engine group. The worker adapter re-indexes them to
+engine-group-info order with `expand_engine_block_ids(engine_group_infos, block_ids)` (each
+info reuses its source engine group's block IDs), so `STORE`/`RETRIEVE` receive
+`list[list[int]]` indexed by info order. The server loop is then trivial: for
+info `i`, use `gpu_block_ids[i]`.
+
+### Per-group block sizes and compression
+
+There is no single "engine block size". Each group has two per-group
+quantities, and everything else is derived from them:
+
+- **`tokens_per_block`** — logical tokens covered by one of the group's paged
+  chunks (one block ID). Read from the group's KV cache spec `block_size` in
+  `kv_cache_config` at initialization and carried in `EngineGroupInfo`.
+  Hybrid models mix values freely (`google/gemma-4-E4B-it`: sliding-window
+  groups 32, full-attention groups 16; DeepSeek-V4-Flash: 256/64/8/4).
+- **`slots_per_block`** — physical slots in one paged chunk, detected from the
+  registered tensors at registration time (the batch-size dimension,
+  `shape_desc.bs`). Only available per kernel group.
+
+A group is compressed when `tokens_per_block > slots_per_block` (each physical
+slot packs `tokens_per_block // slots_per_block` logical tokens): ordinary
+attention has one token per slot, while DeepSeek-V4-Flash's MLA / indexer
+caches pack 4 and 128. No `compress_ratio` is stored — wherever a ratio is
+needed it is computed inline from these two ground-truth quantities. The
+LMCache chunk size must be a multiple of every group's `tokens_per_block`
+(validated at connector init and registration).
+
+The scheduler-side connector does all accounting (hit counts, store/retrieve
+ranges) in *tokens* — the only unit shared by every group — and slices each
+group's block IDs by `token_range / tokens_per_block_g`
+(`slice_block_ids_per_group`). The server counts
+`blocks_per_chunk = lmcache_tokens_per_chunk // tokens_per_block` per group.
+
+### Cross-layer KV sharing
+
+Some models (e.g. `google/gemma-4-E4B-it`) reuse one layer's KV cache for
+another (`kv_caches[layer] = kv_caches[target]`). vLLM lists only cache-*owning*
+layers in `kv_cache_groups`; a sharing layer is absent from every group's
+`layer_names`. Such a layer's KV physically lives in its target owner's blocks,
+so storing/retrieving the owner already covers it. Registration therefore tags
+unlisted layers with `EXCLUDED_ENGINE_GROUP` and `group_layers_by_identity`
+skips them — they never form their own info. (Placing them in a group would
+duplicate work and, when their block size differs from the group they default
+into, corrupt the per-group block-id counts.)
+
+### Scratch groups
+
+A scratch group is an engine group whose spec vLLM marks
+`prefix_cacheable = False` (or `participates_in_prefix_caching = False` on
+older vLLM forks): vLLM never hashes its blocks and its own prefix cache never
+restores them, so they carry no token range LMCache could store.
+The instances LMCache has validated are per-request rings. Every
+sparse-attention layer keeps one ring tensor, vLLM puts them in one engine
+group, and the group holds one block per request for the request's lifetime,
+addressed by position modulo the block size. The ring holds the raw keys of
+the compression group that is still open:
+
+- Qwen3.8-Flash-Next's QSA compressor ring (`CircularBufferSpec`).
+- GLM-5.3-Flash's kpool tail (`KpoolTailSpec`, `block_size = index_kpool`).
+
+LMCache treats a scratch group as covering no tokens. `is_scratch_spec`
+(`kv_cache_groups.py`) reads `prefix_cacheable`, falling back to
+`participates_in_prefix_caching` only when the newer marker is absent. Specs
+with neither marker remain prefix-cacheable. A scratch group's
+`tokens_per_block` is reported as `0`.
+Everything downstream follows from that: the scheduler-side geometry
+(storable prefix, block-id slicing, hit alignment, chunk-size validation)
+ignores `0` spans, and registration skips format discovery for the group's
+layers and forms no info or kernel group for them, so a ring layout the
+transfer kernels cannot serve never fails registration.
+
+This is correct only because LMCache serves chunk-aligned prefixes. vLLM
+requires the cache block size to be a multiple of the compression group width
+(`compress_ratio`, `index_kpool`) and the chunk size is a multiple of the
+block size, so at every chunk boundary the open compression group is empty
+and the ring holds nothing the next step reads. Resuming mid-group (for
+example a prefill-to-decode handoff at an arbitrary prompt length) does need
+the ring's content, and this path does not provide it.
+
+**Store is all-or-nothing (fail-closed):** if the block IDs don't fully cover
+every chunk for every group (e.g. a caller bug), or a copy fails, the whole
+store is skipped and nothing is committed — a later retrieve simply misses and
+the engine recomputes. The non-GPU transfer path rejects multi-group transfers
+outright.
+
+**Failed retrieves:** on vLLM versions exposing `KVConnectorTransferResults`, multi-group receive failures are reported by request ID in both `finished_recving` and `failed_recving`, without flat block errors. This lets vLLM wait for all workers and apply its configured failure policy instead of rejecting an incompatible error report. Single-group models retain block-level reporting so a valid partial prefix can remain reusable; older vLLM versions retain the legacy completion and block-error hooks.
+
+## Example
+
+vLLM exposes two engine groups — group 0: layers [0,2,4], group 1: [1,3]. If
+layers 0–3 share a shape but layer 4 differs, registration produces:
+
+```text
+info 0: engine group 0, layers [0, 2]
+info 1: engine group 1, layers [1, 3]
+info 2: engine group 0, layers [4]
+```
+
+Block IDs `{group 0: [10,11], group 1: [20,21]}` are sent as
+`[[10,11], [20,21], [10,11]]` (infos 0 and 2 share group 0's IDs).
+
+## Invariants
+
+- The `list[EngineGroupInfo]` order is the protocol-visible group order; callers
+  send one block-id list per info.
+- vLLM-specific access stays in `lmcache.integration.vllm`; infos carry neutral
+  metadata only.
+- The server reproduces grouping with the same `group_layers_by_identity`; real
+  tensors remain the source of truth for shape/dtype/stride.
+
+## Mamba / linear-attention hybrids
+
+Supported via registration-time tensor re-views (e.g. Qwen3.5 GDN): Mamba
+state pairs become opaque page views, and full-attention layers whose logical
+block size was inflated for page-size unification are re-viewed at
+logical-block granularity. See
+[kv-cache-group-edits](kv_cache_group_edits.md) for the design and its
+limits (notably: edited groups are byte-opaque — no content-aware processing,
+no cross-backend cache sharing).
+
+### MTP and the last prompt block
+
+With MTP, vLLM's scheduler runs the prompt's last full block and its tail in
+one prefill step, so no Mamba state is ever written for that block's
+boundary. In vLLM's own block list that position becomes the null block
+(id 0), and the speculative block that used to sit there is moved to the
+end. The connector only receives the blocks added at the end, so the tracker
+would still show the moved block at its old position and store it as the
+chunk's Mamba state, which no kernel ever wrote.
+
+vLLM only moves blocks out of the last `num_speculative_tokens` positions, and
+a block is never listed twice for one request. So when a reported id is
+already in those last positions of the tracker's list, `append_block_ids` sets
+the old position to 0. Without align-mode Mamba and speculative decoding the
+window is 0 and ids are appended as-is.
+The server then sees an all-zero chunk for the Mamba group and skips it, and
+the next hit ends one chunk earlier. Needs `--separate-object-groups` and
+chunk size equal to the Mamba block size.
+
+## Code map
+
+| Area | File |
+|---|---|
+| Engine group info (IPC type) + helpers | `lmcache/v1/multiprocess/group_view.py` |
+| Shared grouping primitive | `lmcache/v1/kv_layer_groups.py` |
+| vLLM → `list[EngineGroupInfo]` | `lmcache/integration/vllm/kv_cache_groups.py` |
+| Group metadata edits (Mamba, sub-paged attention) | `lmcache/integration/vllm/kv_cache_group_edits.py` |
+| Register / store / retrieve | `lmcache/integration/vllm/{lmcache_mp_connector,vllm_multi_process_adapter}.py` |
+| Server GPU context / transfer | `lmcache/v1/multiprocess/{gpu_context,modules/lmcache_driven_transfer}.py` |
+| Request RPC contract | `lmcache/v1/multiprocess/transport/base.py` |

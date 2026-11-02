@@ -7,4 +7,4 @@ include requirements/cuda13_core.txt
 include requirements/nixl.txt
 
 recursive-include csrc *
-recursive-include lmcache *.so
+recursive-include lmcache/lmcache_frontend *

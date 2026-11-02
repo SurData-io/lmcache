@@ -1,0 +1,2739 @@
+.. _lmcache-bench:
+
+lmcache bench
+=============
+
+The ``lmcache bench`` command runs performance benchmarks, quality tests, and
+offline cache analyses. It has five sub-commands, each targeting a different
+layer of the stack:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - Sub-command
+     - Description
+   * - ``engine``
+     - Benchmark an inference engine (e.g. vLLM) with workloads that
+       exercise different KV-cache reuse patterns.
+   * - ``server``
+     - End-to-end sanity test against a running LMCache MP cache server
+       (ZMQ + HTTP). Requires the full ``lmcache`` install and a GPU.
+   * - ``l2``
+     - Throughput / latency benchmark against an L2 cache adapter
+       (store / lookup / load).
+   * - ``quality``
+     - Checks whether a serving change (quantization, KV reuse such as
+       CacheBlend, another engine) changes the model's answers against a
+       reference, and gives a PASS / FAIL / UNDERPOWERED / INVALID verdict.
+       Two stages: ``run`` (one or more arms) and ``analyze``.
+   * - ``trace-analyze``
+     - Offline replay of a recorded request trace through a simulated
+       cache: prefix and CacheBlend hit tokens over a capacity and
+       chunk-size grid, as an HTML report.
+
+.. code-block:: bash
+
+   lmcache bench {engine,server,l2,quality,trace-analyze} [options]
+
+
+.. _lmcache-bench-engine:
+
+engine
+------
+
+The ``lmcache bench engine`` command runs sustained performance benchmarks
+against an inference engine (e.g., vLLM). It supports multiple workload types
+that exercise different caching patterns and reports TTFT, decoding speed, and
+throughput metrics. TTFT starts at the first non-empty content or reasoning
+text, including streams with an empty ``content`` field. One workload,
+:ref:`rag-qa-quality <bench-rag-qa-quality>`, measures answer *correctness*
+instead of speed.
+
+.. code-block:: bash
+
+   lmcache bench engine [options]
+
+There are three ways to configure the benchmark:
+
+1. **CLI arguments** -- pass all options on the command line.
+2. **Interactive mode** -- run ``lmcache bench engine`` without required args
+   and follow the step-by-step prompts.
+3. **Config file** -- save a configuration to JSON and replay it with
+   ``--config``.
+
+
+Quick Start
+~~~~~~~~~~~
+
+**Minimal (with all required arguments):**
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload long-doc-qa \
+       --lmcache-url http://localhost:8080
+
+**Interactive mode (guided setup):**
+
+.. code-block:: bash
+
+   lmcache bench engine
+
+The interactive mode walks you through each required setting, then asks
+whether you want to configure general and workload-specific options or use
+defaults.
+
+**From a saved config file:**
+
+.. code-block:: bash
+
+   lmcache bench engine --engine-url http://localhost:8000 \
+       --config my_bench.json
+
+Config files contain benchmark parameters (workload, KV cache settings, etc.)
+but not the engine URL, so you can reuse the same config against different
+engines.
+
+**Export a config without running the benchmark:**
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload long-doc-qa \
+       --lmcache-url http://localhost:8080 \
+       --export-config my_bench.json
+
+This resolves all auto-detected values (model name, tokens per GB) and saves
+them to a portable JSON file that works without an LMCache server.
+
+**Non-interactive mode (for scripts and CI):**
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload long-doc-qa \
+       --lmcache-url http://localhost:8080 \
+       --no-interactive
+
+Errors immediately if any required argument is missing, instead of entering
+interactive mode. Useful in automated pipelines.
+
+If you don't have an LMCache server, you can pass ``--tokens-per-gb-kvcache``
+directly instead of ``--lmcache-url``
+(see :ref:`bench-tokens-per-gb` for how to find this value).
+
+
+General Options
+~~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 10 60
+
+   * - Flag
+     - Required
+     - Description
+   * - ``--config FILE``
+     - No
+     - Load configuration from a JSON file. Skips interactive mode.
+       CLI flags override values in the file. The engine URL is not
+       stored in config files and must be provided separately.
+   * - ``--export-config FILE``
+     - No
+     - Export resolved configuration to a JSON file and exit. Does not
+       run the benchmark. Auto-detected values (model, tokens per GB)
+       are resolved and saved so the config is portable. Environment-
+       specific values (engine URL, LMCache URL) are excluded.
+   * - ``--no-interactive``
+     - No
+     - Disable interactive mode. Errors if required arguments are
+       missing instead of prompting. Useful for scripts and CI.
+   * - ``--engine-url URL``
+     - Yes
+     - Inference engine URL (e.g., ``http://localhost:8000``).
+       Set ``OPENAI_API_KEY`` env var if authentication is needed.
+   * - ``--workload TYPE``
+     - Yes
+     - Workload type: ``long-doc-qa``, ``multi-round-chat``,
+       ``long-doc-permutator``, ``kv-tier-pressure``,
+       ``prefix-suffix-tuner``, ``rag-qa-quality``, or ``random-prefill``.
+   * - ``--tokens-per-gb-kvcache N``
+     - \*
+     - Tokens per GB of KV cache. Required unless ``--lmcache-url`` is set.
+       See :ref:`bench-tokens-per-gb` for how to find this value.
+   * - ``--lmcache-url URL``
+     - No
+     - LMCache HTTP server URL. When provided, ``--tokens-per-gb-kvcache``
+       is auto-detected from the server.
+   * - ``--model NAME``
+     - No
+     - Model name. Auto-detected from the engine if omitted.
+   * - ``--kv-cache-volume GB``
+     - No
+     - Target active KV cache volume in GB (default: 100).
+   * - ``--seed N``
+     - No
+     - Random seed (default: 42).
+   * - ``--output-dir DIR``
+     - No
+     - Directory for CSV and JSON output files (default: current directory).
+   * - ``--no-csv``
+     - No
+     - Skip CSV export.
+   * - ``--json``
+     - No
+     - Export a JSON summary file.
+   * - ``-q`` / ``--quiet``
+     - No
+     - Suppress the real-time progress display.
+   * - ``--no-warmup``
+     - No
+     - Skip the warmup phase and start measuring immediately.
+       See :ref:`bench-warmup`.
+
+
+.. _bench-tokens-per-gb:
+
+Finding ``--tokens-per-gb-kvcache``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If you have an LMCache server running, the easiest approach is to pass
+``--lmcache-url`` and let the tool auto-detect the value.
+
+If you are using **vLLM without LMCache**, look for these lines in vLLM's
+startup log:
+
+.. code-block:: text
+
+   INFO: Available KV cache memory: 12.34 GiB
+   INFO: GPU KV cache size: 567,890 tokens
+
+Then compute::
+
+   tokens_per_gb = 567890 / 12.34 = 46,020
+
+
+.. _bench-warmup:
+
+Warmup Phase
+~~~~~~~~~~~~
+
+Most workloads run a warmup phase before the measured run. What it sends is
+workload-specific -- ``long-doc-qa`` prefills each document, ``rag-qa-quality``
+prefills each document behind the system block, ``prefix-suffix-tuner`` sends a
+full pass over its prefix pool, ``multi-round-chat`` primes each session, and
+``long-doc-permutator`` sends a single dummy request, and ``kv-tier-pressure``
+sweeps its whole document pool once. ``random-prefill`` has no warmup at all.
+Warmup requests are sent with ``max_tokens=1`` and their stats are discarded,
+so they never appear in the reported numbers.
+
+Warmup serves two purposes: it absorbs the engine's one-time first-request cost
+(``torch.compile``, CUDA-graph capture, weight paging), and -- for the workloads
+that prefill their data -- it puts the KV cache in the state the measured run is
+designed to exercise.
+
+``--no-warmup`` skips the phase entirely and starts measuring immediately:
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload long-doc-qa \
+       --lmcache-url http://localhost:8080 \
+       --no-warmup
+
+Use it to measure a cold start -- what the first requests against a fresh
+engine and an empty cache actually cost -- or to shorten a smoke test where the
+absolute numbers do not matter.
+
+.. warning::
+
+   Do not compare a ``--no-warmup`` run against a warmed run: the numbers
+   measure different things. Without warmup, the first requests pay the
+   engine's first-request cost and read from a cold cache, which inflates TTFT
+   and depresses cache hit rate.
+
+   For workloads whose warmup populates the data they then measure reuse of
+   (``long-doc-qa``, ``rag-qa-quality``, ``prefix-suffix-tuner``,
+   ``multi-round-chat``), skipping it removes the reuse the workload was built
+   to measure. ``prefix-suffix-tuner`` in particular reports pass-2 results
+   against a cache that pass 1 was supposed to fill, so its output is not
+   meaningful with ``--no-warmup``.
+
+
+Workloads
+~~~~~~~~~
+
+long-doc-qa
+^^^^^^^^^^^
+
+Simulates repeated Q&A over long documents. Warmup sends each document once
+to populate the KV cache, then benchmark queries are dispatched with
+semaphore-controlled concurrency.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--ldqa-document-length``
+     - 10000
+     - Token length of each synthetic document.
+   * - ``--ldqa-query-per-document``
+     - 2
+     - Number of questions asked per document.
+   * - ``--ldqa-shuffle-policy``
+     - random
+     - Request ordering: ``random`` (shuffled) or ``tile`` (round-by-round).
+   * - ``--ldqa-num-inflight-requests``
+     - 3
+     - Maximum concurrent in-flight requests.
+
+**Example:**
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload long-doc-qa \
+       --lmcache-url http://localhost:8080 \
+       --kv-cache-volume 50 \
+       --ldqa-document-length 8000 \
+       --ldqa-query-per-document 4 \
+       --ldqa-shuffle-policy tile
+
+
+multi-round-chat
+^^^^^^^^^^^^^^^^
+
+Simulates multi-round chat with stateful sessions. Creates concurrent user
+sessions, dispatches requests at a fixed QPS rate, and records responses in
+session history so each subsequent query includes prior context.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--mrc-shared-prompt-length``
+     - 2000
+     - System prompt token length per session.
+   * - ``--mrc-chat-history-length``
+     - 10000
+     - Pre-filled chat history token length.
+   * - ``--mrc-user-input-length``
+     - 50
+     - Tokens per user query.
+   * - ``--mrc-output-length``
+     - 200
+     - Max tokens to generate per response.
+   * - ``--mrc-qps``
+     - 1.0
+     - Target queries per second.
+   * - ``--mrc-duration``
+     - 60.0
+     - Benchmark duration in seconds.
+
+**Example:**
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload multi-round-chat \
+       --lmcache-url http://localhost:8080 \
+       --mrc-qps 2.0 \
+       --mrc-duration 120
+
+
+long-doc-permutator
+^^^^^^^^^^^^^^^^^^^
+
+Stress-tests blended KV cache reuse by sending permutations of a set of context
+documents. Each request concatenates all context documents in a different order:
+
+.. code-block:: text
+
+   [System Prompt] + [Doc_i1] + [Doc_i2] + ... + [Doc_iN]
+
+A single dummy warmup request is sent before the benchmark phase. Requests are
+dispatched with semaphore-controlled concurrency.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--ldp-num-contexts``
+     - 5
+     - Number of unique context documents.
+   * - ``--ldp-context-length``
+     - 5000
+     - Token length of each context document.
+   * - ``--ldp-system-prompt-length``
+     - 1000
+     - Token length of the shared system prompt. Use ``0`` for no system prompt.
+   * - ``--ldp-num-permutations``
+     - 10
+     - Number of distinct permutations to send. Capped at N! where
+       N = ``--ldp-num-contexts``.
+   * - ``--ldp-num-inflight-requests``
+     - 1
+     - Maximum concurrent in-flight requests.
+   * - ``--ldp-max-output-length``
+     - 128
+     - Maximum tokens to generate per permutation request. Use ``1`` to
+       measure prefill alone; combine larger values with ``--ignore-eos``
+       for a reproducible decode phase.
+
+**Example:**
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload long-doc-permutator \
+       --lmcache-url http://localhost:8080 \
+       --ldp-num-contexts 4 \
+       --ldp-context-length 8000 \
+       --ldp-num-permutations 24 \
+       --ldp-num-inflight-requests 2
+
+
+kv-tier-pressure
+^^^^^^^^^^^^^^^^
+
+Exercises the **L2 storage tier**. Where ``long-doc-permutator`` puts every
+document in every request -- so the distinct working set equals one prompt and
+can never overflow L1 -- this workload keeps a document *pool* larger than the
+cache and samples a subset into each request:
+
+.. code-block:: text
+
+   [System Prompt] + [Doc_a] + [Doc_b] + ... + [Doc_k]   (k of D, k << D)
+
+.. important::
+
+   This workload assumes **CacheBlend** (``enable_blending``). Each request
+   concatenates a random subset of the pool in random order, so without
+   blending a document is reused only when everything before it in the prompt
+   also matches — which these prompts almost never satisfy. Such a run writes
+   a great deal to storage and reads very little back, while the *share* of
+   reads served by storage still looks healthy.
+
+   Watch **cache-hit tokens per request**, reported whenever ``--lmcache-url``
+   is given, rather than the storage read share — the share is a ratio between
+   tiers and cannot tell the two cases apart.
+
+   Without blending, use ``--ktp-docs-per-request 1``. Each prompt is then
+   ``[system prompt][document]``, which is prefix-stable and reuses normally.
+   When ``--lmcache-url`` is given the workload verifies this for you. After
+   the warm-up sweep it checks which lookup counter family moved: the blend
+   counters move only when the server runs the blend module *and* vLLM drives
+   it through ``CBKVConnector``. If a multi-document run was not blended it
+   stops there, rather than producing a result that looks reasonable and
+   means nothing.
+
+``--ktp-pool-size`` is what decides whether the storage tier is reached: the
+working set is ``pool_size x --ktp-context-length`` tokens, and only what
+exceeds cache capacity can be evicted and read back. Omit it and the pool is
+sized automatically from the capacity the LMCache server reports via
+``--lmcache-url``, multiplied by ``--ktp-overflow-factor``. To size it by hand
+against a cache of ``V`` GB with a factor of ``F``:
+
+.. code-block:: text
+
+   pool_size = ceil(F * V * tokens_per_gb_kvcache / context_length)
+
+``tokens_per_gb_kvcache`` comes from the engine's KV layout and is resolved
+automatically from ``--lmcache-url`` (see :ref:`bench-tokens-per-gb`). An
+``F`` of 2 means half the working set cannot be resident, so roughly half of
+all cache reads must come from L2.
+
+Treat that only as a dial. The idealised share ``1 - 1 / F`` assumes pure LRU
+over uniformly-drawn whole documents and ignores prefetch re-admission and
+chunk-level sharing: 45% was measured at ``F = 1`` on one stack and 36% at
+``F = 2`` on another. Size the pool with it, then read the share that actually
+occurred from the cache's tier counters.
+
+Warmup is a deterministic sweep: the pool is partitioned into
+``ceil(pool_size / docs_per_request)`` non-overlapping groups and each is sent
+once, so every document is cached exactly once before measurement. This matters
+because until L1 fills there is no eviction and therefore no L2 read -- a share
+measured across a cold start describes run length, not the system.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--ktp-pool-size``
+     - derived
+     - Total documents in the corpus. Sets the working set, and therefore
+       whether the storage tier is reached. Derived from the server's cache
+       capacity and ``--ktp-overflow-factor`` when omitted.
+   * - ``--ktp-overflow-factor``
+     - 2.0
+     - Working set as a multiple of the server's cache capacity. Used only
+       when ``--ktp-pool-size`` is omitted. Above 1.0 forces eviction to
+       storage.
+   * - ``--ktp-docs-per-request``
+     - 16
+     - Documents sampled into each request. Bounded by the engine's context
+       limit, not by the pool size.
+   * - ``--ktp-context-length``
+     - 2560
+     - Token length of each document (10 whole 256-token chunks).
+   * - ``--ktp-system-prompt-length``
+     - 256
+     - Token length of the shared system prompt. Use ``0`` for none.
+   * - ``--ktp-num-requests``
+     - 200
+     - Number of measured requests. The warmup sweep is separate and sized
+       automatically from the pool.
+   * - ``--ktp-access-skew``
+     - 0.0
+     - Zipf exponent for document popularity. ``0.0`` is uniform; larger
+       values concentrate reads on a hot subset, raising the L1 hit rate and
+       lowering the L2 share.
+   * - ``--ktp-num-inflight-requests``
+     - 8
+     - Maximum concurrent in-flight requests.
+   * - ``--ktp-max-output-length``
+     - 1
+     - Maximum tokens to generate per request. The default isolates prefill,
+       the phase the cache tier affects; larger values add decode time that
+       dilutes the measurement.
+
+The run reports a **Document pool** section alongside the standard metrics,
+giving the resolved pool size, working set, access skew and sweep size. These are inputs: the share of reads actually served by L2 comes
+from the cache's own tier counters, not from this workload.
+
+**Example** -- target ~50% of cache reads from L2 against a 100 GB L1:
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload kv-tier-pressure \
+       --lmcache-url http://localhost:8080 \
+       --ktp-pool-size 910 \
+       --ktp-docs-per-request 16 \
+       --ktp-context-length 2560 \
+       --ktp-num-requests 200
+
+Raise ``--ktp-pool-size`` for a larger share of reads from storage, and keep
+it pinned when reproducing an earlier run so the corpus is identical.
+
+
+prefix-suffix-tuner
+^^^^^^^^^^^^^^^^^^^
+
+A two-pass sequential workload designed to be run **unchanged** across
+three LMCache configurations to demonstrate the value of each cache tier
+(L0 HBM, L1 DRAM, L2 disk):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 25 30 30
+
+   * - Baseline
+     - LMCache config
+     - Targeted overflow
+     - Expected pass-2 hits
+   * - 1
+     - vanilla vLLM (L0 only)
+     - L0 (HBM)
+     - none -- every request a cold prefill
+   * - 2
+     - vLLM + LMCache L1 + L2
+     - L1 (DRAM)
+     - L2 prefix hits (suffix recomputed)
+   * - 3
+     - vLLM + LMCache L1 + L2 + CacheBlend
+     - L1 (DRAM)
+     - L2 prefix hits + CacheBlend suffix hits
+
+Set ``--kv-cache-volume`` to the size in GB of the tier you want to overflow
+(L0 size for Baseline 1, L1 size for Baselines 2 and 3). The workload itself
+is identical across baselines.
+
+Each request has the layout::
+
+   [prefix_i with unique-ID][random breaker][shared suffix]
+
+- ``num_prefixes`` distinct prefixes, each starting with ``PREFIX_<8-hex>``
+  so the prefix's tokenized hash differs across the pool.
+- A fresh random 32-token breaker per request, defeating ordinary prefix
+  caching past the prefix boundary.
+- A single shared suffix used by every request -- the only entry CacheBlend
+  can reuse.
+
+Pass 1 (warmup) sends each prefix once to populate the cache; its stats are
+discarded. Pass 2 sends them again in identical order. Because LRU evicts
+the next-needed prefix on each pass-2 access, even a 1.05x overflow of the
+targeted tier is enough to make every pass-2 request miss that tier and
+fall through to the next one.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--psf-context-length``
+     - 8000
+     - Total tokens per request (prefix + breaker + suffix).
+   * - ``--psf-prefix-ratio``
+     - 0.8
+     - Fraction of context-length used by the prefix. Must be in (0.0, 1.0).
+       The remainder (minus a 32-token breaker) is the shared suffix.
+   * - ``--psf-thrash``
+     - 20.0
+     - **Size in GB of the KV-cache tier to overflow.** Use the L0 (HBM)
+       size for vanilla vLLM, or the L1 (LMCache DRAM) size for tiered
+       baselines. The workload sizes its prefix pool to slightly more than
+       this (5% overflow internally), enough to drive every pass-2 request
+       to a miss of that tier under sequential dispatch + LRU.
+
+The number of pass-2 (measured) requests equals the prefix pool size,
+computed as
+``floor(psf_thrash * 1.05 * tokens_per_gb / prefix_tokens)``.
+``--kv-cache-volume`` is unused by this workload — sizing is driven solely
+by ``--psf-thrash``.
+
+**Example:**
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload prefix-suffix-tuner \
+       --lmcache-url http://localhost:8080 \
+       --psf-context-length 8000 \
+       --psf-prefix-ratio 0.8 \
+       --psf-thrash 100
+
+.. note::
+   For the analytical-model claim "thrash ≈ L1 size → ~0% LMCache hit rate"
+   to hold empirically, the LMCache server must be started with
+   ``--eviction-ratio 0.99`` (default ``0.20`` only clears 20% per cycle,
+   leaving ~60% of pass-1 content in cache through pass 2):
+
+   .. code-block:: bash
+
+      lmcache server --l1-size-gb <SIZE> --eviction-policy LRU \
+          --eviction-trigger-watermark 0.80 \
+          --eviction-ratio 0.99
+
+   The workload itself sleeps 5 seconds between pass 1 (warmup) and pass 2
+   (measured), so LMCache's 1Hz batched-eviction polling thread has time
+   to actually run.  Without that sleep, fast benchmarks complete before
+   any eviction fires.
+
+
+.. _bench-rag-qa-quality:
+
+rag-qa-quality
+^^^^^^^^^^^^^^
+
+Measures **answer quality** rather than speed: every other workload reports an
+unchanged number if the cache returns subtly wrong KV. Answers are scored
+against gold answers from a real QA dataset.
+
+Each document is prefilled on its own during warmup; the measured request then
+composes them::
+
+   [system prompt][doc_a][doc_b]...[doc_n][question]
+
+so every document is reused at a position it was never cached at -- the RAG
+serving pattern, with no artificial perturbation.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--rag-dataset``
+     - *required*
+     - A known dataset name (``musique``, ``hotpotqa``) or a path to a local
+       ``.json``, ``.jsonl``, or ``.parquet`` QA file.
+   * - ``--rag-num-samples``
+     - 50
+     - Questions to measure, taken in dataset order.
+   * - ``--rag-max-output-length``
+     - 1024
+     - Token budget per answer. Must fit a reasoning model's thinking block
+       as well as the answer tags.
+   * - ``--rag-template-kwargs``
+     - *(unset)*
+     - Chat-template variables as ``KEY=VALUE``, repeatable. Unset, the
+       model's own template default applies.
+   * - ``--rag-output``
+     - ``<output-dir>/rag_qa_quality.json``
+     - Per-sample results file.
+
+``--kv-cache-volume`` is unused, but ``--tokens-per-gb-kvcache`` (or
+``--lmcache-url``) is still required. A tokenizer is required too, for chunk
+alignment: pass ``--model``, or let it auto-detect from ``/v1/models``.
+
+**Datasets** are not vendored. Named ones download from the HuggingFace Hub on
+first use and cache under ``HF_HOME``; any other value is a local path.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 30 55
+
+   * - Name
+     - Source
+     - Notes
+   * - ``musique``
+     - ``dgslibisey/MuSiQue``
+     - JSONL, 20 passages per question, ~2.1k tokens.
+   * - ``hotpotqa``
+     - ``hotpotqa/hotpot_qa``
+     - Parquet (distractor/validation); requires ``pyarrow``.
+
+Local files load unchanged if their records carry passages, a question, and
+gold answers -- ``ctxs[].{title,text}``, ``paragraphs[].paragraph_text``,
+``context``, or the RAGAS hand-off fields ``retrieved_contexts``,
+``user_input`` and ``reference``. Records missing any of the three are
+skipped.
+
+**Comparing two stacks.** For CacheBlend against full recompute, use
+:ref:`lmcache bench quality <lmcache-bench-quality>`, which runs both arms
+(together or one at a time) and prints a verdict. For other pairs, run the
+workload once per stack and diff the files by ``sample_id``:
+
+.. code-block:: bash
+
+   ARGS="--workload rag-qa-quality --tokens-per-gb-kvcache 6000 \
+         --rag-dataset musique --rag-num-samples 20"
+
+   lmcache bench engine --engine-url http://localhost:8000 $ARGS --rag-output a.json
+   lmcache bench engine --engine-url http://localhost:8001 $ARGS --rag-output b.json
+
+The files are comparable **only when their ``run_fingerprint`` values match**.
+It covers the selected samples' ids, rendered prompts and gold answers,
+along with the dataset path, budget, template kwargs, model, seed and chunk
+alignment. Editing a selected question, document or reference at the same
+dataset path changes the fingerprint; output paths and unmeasured records
+do not. Fingerprints from older versions that covered only sample ids are
+not comparable with these content-based fingerprints.
+
+.. note::
+
+   Start each run from a clean cache -- restart the server, or
+   ``lmcache kvcache clear --url <mp-url>`` -- or the second run hits the
+   first run's cached composites instead of measuring per-document reuse.
+
+.. note::
+
+   No cache-hit metrics are reported; quality is measured from the responses
+   alone. To tell "quality unchanged" apart from "LMCache never engaged",
+   check the engine's own counters around a run::
+
+      curl -s http://localhost:8080/metrics | grep lookup_.*_tokens_total
+
+**Reasoning models.** ``--rag-template-kwargs`` has no default: disabling
+thinking can lower multi-hop QA quality, and the right setting is
+model-specific (``enable_thinking=true``, ``reasoning_effort=high``). Too
+small a budget cuts generation off before the closing tag, so the sample
+does not parse and drops out of the score -- watch ``Parse rate``.
+
+
+random-prefill
+^^^^^^^^^^^^^^
+
+Fires all requests simultaneously with ``max_tokens=1`` to measure pure
+prefill performance. No warmup phase.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--rp-request-length``
+     - 10000
+     - Token length per prefill request.
+   * - ``--rp-num-requests``
+     - 50
+     - Number of requests to fire.
+
+**Example:**
+
+.. code-block:: bash
+
+   lmcache bench engine \
+       --engine-url http://localhost:8000 \
+       --workload random-prefill \
+       --lmcache-url http://localhost:8080 \
+       --rp-request-length 15000 \
+       --rp-num-requests 100
+
+
+Interactive Mode
+~~~~~~~~~~~~~~~~
+
+.. image:: /_static/bench_interactive_demo.gif
+   :alt: Interactive mode demo
+   :width: 100%
+
+When ``--engine-url`` or ``--workload`` is not provided (and
+``--no-interactive`` is not set), the tool enters interactive mode. It guides
+you through four phases:
+
+1. **Required settings** -- engine URL, workload type, LMCache server
+   (or tokens per GB).
+2. **General settings** (optional gate) -- model name, KV cache volume.
+3. **Workload settings** (optional gate) -- workload-specific parameters.
+4. **Summary and action** -- review configuration, then start the benchmark
+   or export to a JSON file.
+
+Each prompt focuses on a single setting. Selection prompts use arrow keys;
+text and number prompts accept typed input with defaults shown in brackets.
+
+.. code-block:: text
+
+   ══════════════════════════════════════════════════
+    lmcache bench engine -- Interactive Setup
+   ══════════════════════════════════════════════════
+
+   Engine URL
+     URL of the inference engine.
+     [default: http://localhost:8000] >
+
+   Workload
+     The type of benchmark workload to run.
+     Use up/down to navigate, Enter to select.
+
+     * long-doc-qa           Repeated Q&A over long documents
+       multi-round-chat       Multi-turn chat with stateful sessions
+       long-doc-permutator    Permutations of context documents
+       prefix-suffix-tuner    Two-pass tiered KV-cache demonstrator
+       rag-qa-quality         Answer quality (F1) on real QA data
+       random-prefill         Prefill-only requests fired simultaneously
+
+   LMCache Server
+     Do you have a running LMCache server?
+     It can auto-detect KV cache size information.
+     [default: Y] (Y/n) >
+
+   ...
+
+   ──────────────────────────────────────────────────
+    Configuration Summary
+   ──────────────────────────────────────────────────
+     Workload:             long-doc-qa
+     Model:                Qwen/Qwen3-14B
+     Tokens per GB:        6553
+     ...
+   ──────────────────────────────────────────────────
+
+   What would you like to do?
+     * Start benchmark
+       Export configuration for later use and exit
+
+When you choose "Export configuration", all auto-detected values (model name,
+tokens per GB) are resolved and saved to a portable JSON file.
+
+
+Config File
+~~~~~~~~~~~
+
+Config files store benchmark parameters but **not** environment-specific
+values like engine URL or LMCache URL. This lets you reuse the same config
+across different environments.
+
+You can create a config file in three ways:
+
+1. **Interactive mode** -- choose "Export configuration" at the summary step.
+2. **``--export-config``** -- resolve and export from CLI without running.
+3. **Manually** -- write JSON with keys matching CLI arg names (dashes
+   replaced by underscores).
+
+Example config file:
+
+.. code-block:: json
+
+   {
+     "model": "Qwen/Qwen3-14B",
+     "workload": "long-doc-qa",
+     "tokens_per_gb_kvcache": 6553,
+     "kv_cache_volume": 100.0,
+     "ldqa_document_length": 10000,
+     "ldqa_query_per_document": 2,
+     "ldqa_shuffle_policy": "random",
+     "ldqa_num_inflight_requests": 3
+   }
+
+Load it with ``--config`` (engine URL must be provided separately):
+
+.. code-block:: bash
+
+   lmcache bench engine --engine-url http://localhost:8000 \
+       --config my_bench.json
+
+CLI arguments override config file values, so you can use a base config and
+tweak individual settings:
+
+.. code-block:: bash
+
+   # Use saved config but override KV cache volume
+   lmcache bench engine --engine-url http://localhost:8000 \
+       --config my_bench.json --kv-cache-volume 200
+
+
+Output
+~~~~~~
+
+Terminal (real-time progress)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+During the benchmark, a live progress display shows in-flight requests,
+average TTFT, decode speed, and throughput. Suppress it with ``-q``.
+
+Terminal (final summary)
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+After completion, a summary table is printed:
+
+.. code-block:: text
+
+   ======= Engine Benchmark Result (long-doc-qa) ========
+   ---------------------- Configuration ------------------
+   Engine URL:                       http://localhost:8000
+   Model:                            Qwen/Qwen3-14B
+   Workload:                         long-doc-qa
+   ------------------------- Results ---------------------
+   Successful requests:              20
+   Failed requests:                  0
+   Benchmark duration (s):           31.34
+   Total input tokens:               200000
+   Total output tokens:              2560
+   Input throughput (tok/s):         6381.62
+   Output throughput (tok/s):        81.69
+   --------------- Time to First Token -------------------
+   Mean TTFT (ms):                   313.41
+   P50 TTFT (ms):                    272.83
+   P90 TTFT (ms):                    587.21
+   P99 TTFT (ms):                    837.32
+   ------------------ Decoding Speed ---------------------
+   Mean decode (tok/s):              48.23
+   P99 decode (tok/s):               38.55
+   ======================================================
+
+A workload may append sections of its own after the shared ones.
+``rag-qa-quality`` adds **Answer Quality**:
+
+.. code-block:: text
+
+   -------------------- Answer Quality --------------------
+   Samples measured:                                     20
+   Samples scored:                                       20
+   Parse rate:                                         1.00
+   Mean F1 (scored only):                              0.31
+   Run fingerprint:                        61709aae928fdba8
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Field
+     - Meaning
+   * - ``Samples measured``
+     - Questions sent.
+   * - ``Samples scored``
+     - Of those, how many produced a complete ``<final_answer>`` region.
+   * - ``Parse rate``
+     - ``scored / measured``. A low value means the output budget is too
+       small or the model is ignoring the answer tags -- fix that before
+       reading the F1.
+   * - ``Mean F1 (scored only)``
+     - SQuAD-normalized token-overlap F1, best over the gold answers,
+       averaged over **scored samples only**. Always read it together with
+       the parse rate: a high F1 over a third of the samples is a different
+       result from the same F1 over all of them.
+   * - ``Run fingerprint``
+     - Digest of everything determining the prompts. Two runs are comparable
+       only when these match.
+
+CSV and JSON
+^^^^^^^^^^^^
+
+- ``bench_results.csv`` -- per-request metrics (TTFT, latency, decode speed,
+  token counts). Written by default; skip with ``--no-csv``.
+- ``bench_summary.json`` -- aggregate statistics with percentiles and config
+  metadata. Opt-in with ``--json``.
+
+Both files are written to ``--output-dir`` (default: current directory).
+
+Per-sample quality results
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``rag-qa-quality`` additionally writes its own file to ``--rag-output``:
+
+.. code-block:: json
+
+   {
+     "run_fingerprint": "61709aae928fdba8",
+     "model": "meta-llama/Llama-3.1-8B-Instruct",
+     "config": {"dataset": "musique", "num_samples": 20, "max_output_length": 256,
+                "template_kwargs": {}, "output_path": "a.json"},
+     "summary": {"num_samples": 20, "num_parsed": 20, "parse_rate": 1.0,
+                 "f1_mean": 0.3144},
+     "per_sample": [
+       {"sample_id": "2hop__481349_302087", "f1": 0.6667, "parsed": true,
+        "answer": "Bombardier Aerospace", "ttft": 0.1624, "num_output_tokens": 26},
+       {"sample_id": "2hop__697790_864352", "f1": null, "parsed": false,
+        "answer": "", "ttft": 0.1701, "num_output_tokens": 256}
+     ]
+   }
+
+An unparsed sample's ``f1`` is ``null``, **not** ``0.0`` -- so a cross-run
+diff can pair by ``sample_id`` and skip what either run failed to score,
+rather than averaging a parsing failure in as a wrong answer.
+
+
+Exit Codes
+~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 85
+
+   * - Code
+     - Meaning
+   * - ``0``
+     - All requests succeeded.
+   * - ``1``
+     - One or more requests failed.
+
+
+.. _lmcache-bench-server:
+
+server
+------
+
+The ``lmcache bench server`` command is an end-to-end sanity test for the
+LMCache Multi-Process (MP) cache server. It connects to a running server
+over ZMQ and exercises the full KV-cache data path for a sequence of
+synthetic requests, then verifies per-chunk checksums in local worker buffers.
+
+.. code-block:: bash
+
+   lmcache bench server [options]
+
+Unlike :ref:`lmcache bench engine <lmcache-bench-engine>`, this command does
+**not** require an inference engine. It only needs a running LMCache MP
+server (ZMQ). GPU mode additionally requires a CUDA-capable device.
+It also requires the full ``lmcache`` install (not the lightweight
+``lmcache-cli`` package).
+
+
+What it does
+~~~~~~~~~~~~
+
+For each sequence in ``[--start, --end)``, the tool runs two passes. Each
+pass reserves request-exclusive KV blocks and releases them when it finishes.
+
+1. **Cold pass** -- ``LOOKUP`` is expected to miss. The benchmark fills
+   request blocks with deterministic KV and records local per-chunk checksums
+   before ``STORE``.
+2. **Warm pass** -- ``LOOKUP`` is expected to hit. The benchmark clears the
+   allocated destination blocks, retrieves the cached KV, and compares each
+   reader's checksums with the cold-pass reference. The two passes may use
+   different physical block IDs.
+
+The full RPC path exercised is::
+
+   REGISTER_KV_CACHE → GET_CHUNK_SIZE → LOOKUP
+     → QUERY_PREFETCH_STATUS → RETRIEVE → STORE
+     → END_SESSION
+
+Both transfer modes verify local buffers. In ``lmcache_driven`` mode, ``--url``
+also enables server checksum comparisons before STORE and after RETRIEVE,
+reported separately. HTTP failures or mismatches fail this check. An empty
+``--url`` disables HTTP checks; ``engine_driven`` mode skips them.
+
+
+STORE/RETRIEVE runs enabled workers concurrently; latency covers dispatch through
+completion of all workers. ``--transfer-timeout`` bounds each call's wait. After a
+timeout or transfer exception, close the client before reuse. Shutdown waits for
+running transfers and may block if a native call hangs.
+
+Quick start
+~~~~~~~~~~~
+
+Start the MP server in one terminal:
+
+.. code-block:: bash
+
+   lmcache server \
+       --host localhost --port 15556 \
+       --chunk-size 256 --l1-size-gb 5 \
+       --eviction-policy LRU --max-workers 1
+
+Then in another terminal:
+
+.. code-block:: bash
+
+   lmcache bench server \
+       --rpc-url tcp://localhost:15556 \
+       --url http://localhost:8080
+
+By default the tool runs forever (``--end`` unset); stop it with
+``Ctrl-C`` at any time. Pass ``--end N`` for a bounded run.
+
+
+Options
+~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--rpc-url URL``
+     - ``tcp://localhost:5555``
+     - ZMQ endpoint of the MP cache server.
+   * - ``--url URL``
+     - ``http://localhost:8080``
+     - HTTP endpoint for checksum verification in ``lmcache_driven`` mode.
+       Pass an empty string to disable HTTP checks; ``engine_driven`` mode
+       skips them. Local round-trip verification still runs in both modes.
+   * - ``--mode {gpu,cpu}``
+     - ``gpu``
+     - Run mode. ``gpu`` allocates real CUDA tensors and uses CUDA IPC
+       (lmcache-driven handle path). ``cpu`` allocates regular CPU tensors and
+       uses the engine-driven (worker-side gather/scatter) path by default.
+   * - ``--transfer-mode {auto,engine_driven,lmcache_driven}``
+     - ``auto``
+     - Transport routing for STORE/RETRIEVE. ``lmcache_driven`` forces the
+       single-shot handle path (``REGISTER_KV_CACHE`` + ``STORE``/``RETRIEVE``),
+       which supports both CUDA IPC and CPU SHM zero-copy transfers.
+       ``engine_driven`` forces the worker-side gather/scatter path
+       (``REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT`` + ``PREPARE``/``COMMIT``).
+       ``auto`` maps gpu→lmcache_driven and cpu→engine_driven.
+   * - ``--num-tokens N``
+     - ``512``
+     - Tokens per synthetic request.
+   * - ``--block-allocation {sequential,random}``
+     - ``sequential``
+     - Allocate the lowest free block IDs or sample from all free IDs.
+   * - ``--transfer-timeout SECS``
+     - ``10``
+     - Positive, finite wait budget for each STORE or RETRIEVE call.
+   * - ``--num-blocks N``
+     - ``1024``
+     - Fallback block capacity per KV group; overridden by the shape spec.
+   * - ``--block-size N``
+     - ``16``
+     - Fallback tokens per block; overridden by the shape spec.
+   * - ``--start N``
+     - ``0``
+     - First sequence number to run.
+   * - ``--end N``
+     - *(unset)*
+     - Exclusive upper bound on sequence numbers. When omitted the
+       loop runs forever.
+   * - ``--interval SECS``
+     - ``0.5``
+     - Delay between successive sub-passes.
+   * - ``--concurrency N``
+     - ``1``
+     - Number of clients sending requests at the same time (see below).
+   * - ``--kvcache-shape-spec SPEC``
+     - ``(2,1024,16,8,128):float16:32``
+     - KV cache shape spec (see below).
+   * - ``--format FORMAT``
+     - ``terminal``
+     - Stdout output format for the final metrics summary. Available:
+       ``terminal``, ``json``.
+   * - ``--output PATH``
+     - *(unset)*
+     - Save the final metrics summary to a file at PATH (format chosen
+       by ``--format``).
+   * - ``-q`` / ``--quiet``
+     - *(unset)*
+     - Suppress all progress messages during the run. Only the final
+       structured metrics summary is emitted (unless also redirected
+       via ``--output``).
+
+
+Block allocation
+~~~~~~~~~~~~~~~~
+
+Each KV group has an independent block pool. Active requests reserve
+exclusive blocks; all TP ranks use the same block IDs for a group in their
+separate KV buffers. Each concurrent client owns its own pools.
+Blocks are currently not shared between requests, even when their token
+prefixes match.
+
+``--block-allocation sequential`` selects the lowest free IDs; ``random``
+samples free IDs to exercise non-contiguous block mappings. Blocks become
+reusable after request release. Allocation fails immediately if any group
+lacks capacity, without reserving blocks in other groups.
+
+Capacity and block size come from ``NB`` and ``BS`` in
+``--kvcache-shape-spec``, overriding ``--num-blocks`` and ``--block-size``.
+For example, 512 tokens in complete chunks with a block size of 16 require
+32 blocks per group.
+
+If transfer completion is uncertain, the client rejects further operations
+and retains its blocks until teardown.
+
+
+CPU mode (no GPU)
+~~~~~~~~~~~~~~~~~
+
+``--mode cpu`` runs the same end-to-end path without a GPU. The server
+runs on a CPU-only host (``StubCPUDevice``); the bench tool allocates regular
+CPU KV tensors and exercises the full RPC path through ``TransferContext``.
+The engine-driven context uses server-owned SHM staging when available and
+falls back to typed inline tensor transport. In ``lmcache_driven`` mode, the CPU wrapper
+migrates the tensors to POSIX SHM during registration.
+
+By default ``--mode cpu`` uses the engine-driven gather/scatter path
+(``auto`` → ``cpu→engine_driven``); that path requires the server to
+be started with ``--supported-transfer-mode engine_driven`` or
+``auto``, since the server's default ``lmcache_driven`` does not load
+it. To use the zero-copy SHM handle path instead, pass
+``--transfer-mode lmcache_driven``:
+
+.. code-block:: bash
+
+   # Terminal 1 -- start the LMCache server (no GPU required)
+   lmcache server \
+       --host localhost --port 5555 \
+       --l1-size-gb 2 --eviction-policy LRU
+
+   # Terminal 2 -- run bench in CPU + lmcache_driven mode
+   lmcache bench server \
+       --rpc-url tcp://localhost:5555 \
+       --url http://localhost:8080 \
+       --mode cpu --transfer-mode lmcache_driven \
+       --start 0 --end 2
+
+
+KV cache shape spec
+~~~~~~~~~~~~~~~~~~~
+
+The ``--kvcache-shape-spec`` flag describes how KV tensors are laid out on
+the GPU. A spec is one or more groups separated by ``;``:
+
+.. code-block:: text
+
+   (kv_size,NB,BS,NH,HS):dtype:layers[;(...):dtype:layers...]
+
+Fields:
+
+* ``kv_size`` -- 2 for classical attention (separate K/V), 1 for MLA.
+* ``NB`` -- number of paged blocks.
+* ``BS`` -- block size (tokens per block).
+* ``NH`` -- number of attention heads per layer.
+* ``HS`` -- head size (in elements).
+* ``dtype`` -- element dtype (e.g. ``float16``, ``bfloat16``, ``float32``,
+  ``uint8``). The full set matches the keys of ``DTYPE_MAP`` in
+  ``lmcache/v1/kv_layer_groups.py``.
+* ``layers`` -- number of layers in this group.
+
+Multi-group specs let you model heterogeneous layers (for example, MLA
+layers + classical attention layers in the same model):
+
+.. code-block:: bash
+
+   lmcache bench server \
+       --rpc-url tcp://localhost:15556 \
+       --kvcache-shape-spec "(1,1024,16,1,128):float16:4;(2,1024,16,8,128):float16:28"
+
+All groups must share the same ``NB`` and ``BS`` (this is a physical
+constraint of paged KV). Layer counts across groups sum to the total
+layer count registered with the server.
+
+MLA (Multi-head Latent Attention)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Set ``kv_size=1`` to exercise the MLA data path. MLA folds K and V into
+a single latent plane, so each chunk on the wire is
+``(num_layers, chunk_tokens, num_heads * head_size)`` instead of the
+classical ``(2, num_layers, chunk_tokens, num_heads * head_size)``.
+The bench also allocates each per-layer client tensor as rank-3
+``(NB, BS, num_heads * head_size)`` (rather than the classical rank-5
+``(2, NB, BS, NH, HS)``), which is what the server's vLLM detector
+recognises as MLA -- see ``NL_X_NB_BS_HS`` in
+``lmcache/v1/gpu_connector/kv_format/detectors/vllm.py``.
+
+Pure MLA example (DeepSeek-V2-style, 61 layers, single latent head):
+
+.. code-block:: bash
+
+   lmcache bench server \
+       --rpc-url tcp://localhost:15556 \
+       --kvcache-shape-spec "(1,1024,16,1,128):bfloat16:61"
+
+Both transfer modes support MLA:
+
+* ``lmcache_driven`` (GPU default / CPU opt-in): the server discovers
+  ``use_mla`` from the registered tensor shapes -- the bench's rank-3
+  MLA client tensors trip this automatically.
+* ``engine_driven`` (CPU default): the bench derives ``use_mla`` from
+  the tensor layout through ``TransferContext``, so the server sizes its SHM
+  chunks correctly.
+
+.. note::
+
+   Heterogeneous specs that mix ``kv_size=1`` and ``kv_size=2`` groups
+   are supported in ``lmcache_driven`` mode -- each layer's rank (3 vs. 5)
+   tells the detector which per-group KV format to use. ``engine_driven``
+   currently supports one KV group per context; use ``lmcache_driven`` for
+   heterogeneous or hybrid KV groups.
+
+Tensor Parallel (TP > 1)
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+``--tp-size N`` (default: 1) simulates a TP world of ``N`` vLLM
+workers against a single LMCache server. Each rank registers its own
+KV cache under a distinct ``instance_id``, so the server holds one
+context per rank -- exactly the layout ``LMCacheMPWorkerAdapter``
+creates in a real deployment. Fan-out for the store / retrieve /
+lookup ops mirrors ``ParallelStrategy`` from the vLLM adapter:
+
+* ``LOOKUP`` fires exactly once per request (scheduler-scoped,
+  ``worker_id=None``).
+* ``RETRIEVE`` fires on **every** rank -- each worker loads its own
+  KV shard back.
+* ``STORE`` fires on **KV writers only**. Non-MLA: every rank is a
+  writer. MLA: only rank 0 is a writer (the latent plane is shared
+  across ranks; storing from every rank would just re-write identical
+  bytes).
+
+Example: MLA + TP=2, exercising rank 0 STORE + both-rank RETRIEVE:
+
+.. code-block:: bash
+
+   lmcache bench server \
+       --rpc-url tcp://localhost:15556 \
+       --mode cpu --transfer-mode lmcache_driven \
+       --kvcache-shape-spec "(1,1024,16,1,128):bfloat16:8" \
+       --tp-size 2
+
+Replicated readers use their writer's KV identity for deterministic filling.
+The bench verifies retrieved data on every rank and reports the rank and
+chunk for checksum mismatches.
+
+See ``parse_kvcache_shape_spec`` in ``lmcache/v1/kv_layer_groups.py``
+for the authoritative parsing rules and validation errors.
+
+
+Concurrent clients
+~~~~~~~~~~~~~~~~~~
+
+With the default ``--concurrency 1`` a single client sends one request at a
+time, so the run measures per-request latency but never queues work on the
+server. ``--concurrency N`` runs ``N`` clients in parallel, each with its own
+connection and KV tensors, and its Workers registered under their own
+``instance_id`` block. Sequences are dealt round-robin (client ``k`` runs
+``start + k``, ``start + k + N``, ...), so no two clients touch the same
+keys and the cold/warm checks stay valid.
+
+.. code-block:: bash
+
+   lmcache bench server \
+       --rpc-url tcp://localhost:5555 --mode cpu \
+       --start 0 --end 400 --interval 0 --concurrency 8
+
+The summary adds ``Concurrency``, ``Elapsed (s)``, and ``Requests / s``.
+Use ``--interval 0`` when comparing throughput, otherwise the delay
+dominates. ``Requests / s`` counts cold/warm sequence pairs, matching
+``Total requests``.
+
+Size the server's L1 to hold the whole run. If stores arrive faster than
+the eviction controller frees memory, the server drops them, and the
+affected warm lookups miss and fail their checks.
+
+Profiling the server
+~~~~~~~~~~~~~~~~~~~~~
+
+``lmcache bench server`` is a ZMQ client: the store path it exercises
+(hashing, allocation, gather, D2H) runs inside the **server** process, not
+this benchmark. ``--flamegraph on`` therefore attaches the profiler to a
+server pid you supply, records for the duration of the load, and renders a
+flame graph of the server, not of the client.
+
+.. code-block:: bash
+
+   lmcache bench server \
+       --rpc-url tcp://localhost:5555 \
+       --start 0 --end 200 --interval 0.02 \
+       --flamegraph on --flamegraph-mode gil \
+       --profile-server-pid "$(pgrep -f 'lmcache server')"
+
+``--flamegraph-mode`` takes the same six values documented under
+:ref:`lmcache tool flamegraph <lmcache-flamegraph-modes>` (or several
+comma-separated to drive the load once per mode, one SVG each). Because the
+target is a separate, already-running server (not a process this benchmark
+spawns), it profiles by *attaching*, so the same attach-mode caveats
+documented for
+:doc:`lmcache tool flamegraph </cli/tool>` apply here: what each mode
+shows, the ``PYTHONPERFSUPPORT=1`` requirement for naming Python frames in
+the perf/bcc modes, the container privileges each mode needs, and the fact
+that recording a live process is never free.
+
+.. note::
+
+   The one thing unique to ``bench server``: it records *while* it drives
+   load, so the recording overhead lands on the very throughput/latency
+   this benchmark reports. Keep the profiled run short and read those
+   numbers as indicative, not a clean baseline.
+
+
+Output
+~~~~~~
+
+After the run completes (or is interrupted with ``Ctrl-C``), a structured
+metrics summary is printed. The summary includes:
+
+* **Configuration** -- RPC URL, mode, transfer mode, tokens per request,
+  interval, concurrency.
+* **Results** -- total requests, checksum OK / FAIL counts, checksum pass rate,
+  elapsed time, requests per second.
+* **Latency sections** -- per-operation latency statistics (count, mean,
+  min, max, p50, p99) for cold lookup, cold store, warm lookup, and warm
+  retrieve.
+
+Use ``--format json`` to get machine-readable output, or ``--output FILE``
+to save the summary to a file.
+
+.. code-block:: text
+
+   ================ Server Bench Result =================
+   ---------------------- Configuration -----------------
+   RPC URL:                          tcp://localhost:15556
+   Mode:                             gpu
+   Transfer mode:                    auto
+   Tokens / request:                 512
+   Interval (s):                     0.5
+   ------------------------- Results --------------------
+   Total requests:                   3
+   Checksum OK:                      3
+   Checksum FAIL:                    0
+   Checksum pass rate (%):           100.0
+   -------------------- Cold Lookup (ms) ---------------
+   count:                            3
+   mean:                             1.647
+   min:                              1.312
+   max:                              1.823
+   p50:                              1.647
+   p99:                              1.823
+   --------------------- Cold Store (ms) ---------------
+   count:                            3
+   mean:                             1.740
+   min:                              1.521
+   max:                              1.982
+   p50:                              1.740
+   p99:                              1.982
+   -------------------- Warm Lookup (ms) ---------------
+   count:                            3
+   mean:                             1.310
+   min:                              1.102
+   max:                              1.512
+   p50:                              1.310
+   p99:                              1.512
+   ------------------- Warm Retrieve (ms) --------------
+   count:                            3
+   mean:                             1.480
+   min:                              1.321
+   max:                              1.612
+   p50:                              1.480
+   p99:                              1.612
+   =====================================================
+
+
+Example output (progress)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+During the run, progress messages are printed to stdout (suppressed by
+``-q`` / ``--quiet``):
+
+.. code-block:: text
+
+   Connecting to LMCache MP Server at tcp://localhost:15556 (mode=gpu) ...
+   Server chunk_size = 256
+   Resolved KV shape spec: (2,1024,16,8,128):float16:32
+   [seq=0] LOOKUP cold:  0/2 chunks hit (1.82 ms)
+   [seq=0] STORE:        2 chunks stored (1.74 ms)
+   [seq=0] LOOKUP warm:  2/2 chunks hit (1.31 ms)
+   [seq=0] RETRIEVE:     2 chunks retrieved (1.48 ms)
+   [seq=0] CHECKSUM MATCH OK
+   [seq=1] ...
+
+Any ``CHECKSUM MISMATCH``, ``ERROR``, or Python traceback in the log
+indicates a real problem worth investigating.
+
+
+Exit codes
+~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 85
+
+   * - Code
+     - Meaning
+   * - ``0``
+     - Test loop completed (or was interrupted cleanly with Ctrl-C)
+       with no checksum mismatches.
+   * - ``1``
+     - Fatal error (for example, CUDA unavailable in ``--mode gpu``,
+       server unreachable, or a checksum mismatch).
+
+.. _lmcache-bench-l2:
+
+l2
+--
+
+The ``lmcache bench l2`` command benchmarks an L2 cache adapter
+(e.g. the local-filesystem adapter) end-to-end through the same
+``parse_args_to_l2_adapters_config`` + ``create_l2_adapter`` pipeline that
+LMCache uses in production. Any registered adapter type can be tested
+without code changes: you describe the adapter with a single JSON spec
+and pick the operations to exercise.
+
+.. code-block:: bash
+
+   lmcache bench l2 [options]
+
+Unlike :ref:`lmcache bench engine <lmcache-bench-engine>`, this command
+does **not** require an inference engine or an LMCache MP server. It
+only needs the adapter's own backing storage to be reachable (for the
+``fs`` adapter, that simply means a writable directory).
+
+
+What it does
+~~~~~~~~~~~~
+
+For each measured operation the tool drives the adapter directly via
+its public submit/wait API:
+
+* ``Store``  -- ``submit_store_task`` writes ``num_keys`` MemoryObjs per
+  submit and waits for the store eventfd.
+* ``Lookup`` -- ``submit_lookup_and_lock_task`` checks key existence
+  (no payload transfer) and waits for the lookup eventfd.
+* ``Load``   -- ``submit_load_task`` reads ``num_keys`` MemoryObjs per
+  submit and waits for the load eventfd.
+
+Each measured **round** issues ``--in-flight`` submits sequentially from
+a single producer thread and then waits for all of them to complete; the
+round duration is the wall-clock time from the first submit until the
+last completion. Warmup rounds run before measurement and their results
+are discarded from the final summary.
+
+All three operations share the same key idx universe, so running
+``--only store`` followed by ``--only load`` (or ``--only lookup``) with
+identical other flags hits exactly the same keys. This makes the
+benchmark useful as a quick regression test for adapters that should
+support a clean store -> load round-trip.
+
+.. note::
+
+   When ``--only`` is not given, the three operations are run **in a
+   single process in the order** ``store -> lookup -> load``. For
+   adapters whose backing storage sits behind an OS-level cache --
+   most notably the local-filesystem (``fs``) adapter, which is
+   subject to the Linux **page cache** -- this means ``lookup`` and
+   ``load`` will almost always observe the data that ``store`` just
+   wrote still hot in RAM, and the reported numbers reflect
+   page-cache throughput rather than the underlying device.
+
+   To benchmark each operation against a cold cache, run them
+   separately with ``--only`` and drop the OS caches in between, for
+   example::
+
+      lmcache bench l2 --l2-adapter '...' --only store
+      sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+      lmcache bench l2 --l2-adapter '...' --only lookup
+      sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+      lmcache bench l2 --l2-adapter '...' --only load
+
+   For adapters that bypass the page cache (e.g. ``fs`` with
+   ``"use_odirect": true``) or that talk to a remote service without
+   a local cache, the default combined run is usually fine.
+
+   O_DIRECT adapters may also require the benchmark L1 buffer to
+   satisfy the adapter's block alignment. Use ``--l1-align-bytes`` to
+   set that alignment, commonly ``4096`` for local block devices. The
+   payload size (``--data-size-kb * 1024``) must be a multiple of the
+   selected alignment.
+
+   To benchmark against a hugepage-backed L1 tier, pass
+   ``--l1-use-hugepages``. The buffer is then allocated from the 2 MiB
+   hugepage pool. Pre-allocate enough pages with ``sysctl vm.nr_hugepages``;
+   the buffer needs ``ceil(2 * in_flight * num_keys * data_size / 2 MiB)``
+   pages.
+
+
+Quick start
+~~~~~~~~~~~
+
+Benchmark the local filesystem adapter with default parameters:
+
+.. code-block:: bash
+
+   lmcache bench l2 \
+       --l2-adapter '{"type":"fs","base_path":"/tmp/lmcache-bench"}'
+
+This runs all three operations (store, lookup, load) with one warmup
+round and one measurement round.
+
+Stress the adapter with more in-flight submits and larger payloads:
+
+.. code-block:: bash
+
+   lmcache bench l2 \
+       --l2-adapter '{"type":"fs","base_path":"/data/lmcache-bench","relative_tmp_dir":"tmp"}' \
+       --num-keys 32 --in-flight 4 \
+       --data-size-kb 512 \
+       --rounds 5 --warmup-rounds 1
+
+Benchmark an O_DIRECT adapter with aligned L1 buffers:
+
+.. code-block:: bash
+
+   lmcache bench l2 \
+       --l2-adapter '{"type":"raw_block","device_path":"/dev/nvme0n1","slot_bytes":4194304,"use_odirect":true,"block_align":4096}' \
+       --data-size-kb 1024 \
+       --l1-align-bytes 4096
+
+Run only one operation (useful to isolate store vs. load throughput):
+
+.. code-block:: bash
+
+   lmcache bench l2 \
+       --l2-adapter '{"type":"fs","base_path":"/tmp/lmcache-bench"}' \
+       --only store
+
+Lookup with a controlled hit rate (the benchmark splits the lookup keys
+between a potentially-existing range and a guaranteed-non-existent
+range):
+
+.. code-block:: bash
+
+   lmcache bench l2 \
+       --l2-adapter '{"type":"fs","base_path":"/tmp/lmcache-bench"}' \
+       --only lookup --lookup-max-hit-rate 0.5
+
+Enable a store -> load round-trip data integrity check on the last
+measured round:
+
+.. code-block:: bash
+
+   lmcache bench l2 \
+       --l2-adapter '{"type":"fs","base_path":"/tmp/lmcache-bench"}' \
+       --no-skip-verify
+
+If you prefer to keep the JSON spec out of the command line, set the
+``L2_ADAPTER_JSON`` environment variable instead of passing
+``--l2-adapter``:
+
+.. code-block:: bash
+
+   export L2_ADAPTER_JSON='{"type":"fs","base_path":"/tmp/lmcache-bench"}'
+   lmcache bench l2 --num-keys 32 --in-flight 2
+
+
+Options
+~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--l2-adapter JSON``
+     - *(unset)*
+     - L2 adapter spec as JSON with a ``"type"`` field plus
+       adapter-specific configs, e.g.
+       ``'{"type":"fs","base_path":"/tmp/bench"}'``. May be passed
+       multiple times; only the first spec is benchmarked. If not
+       provided, falls back to the ``L2_ADAPTER_JSON`` environment
+       variable. Either the flag or the env var is **required**.
+   * - ``--num-keys N``
+     - ``32``
+     - Number of keys per submit.
+   * - ``--in-flight N``
+     - ``1``
+     - In-flight submits per round. Each round issues this many
+       submits sequentially from a single producer thread, then waits
+       for all of them.
+   * - ``--data-size-kb N``
+     - ``256``
+     - Data size per key, in KiB.
+   * - ``--l1-align-bytes N``
+     - ``1``
+     - Alignment in bytes for benchmark L1 buffers. Use a value
+       at least as large as the adapter's block alignment when
+       benchmarking O_DIRECT backends, for example ``4096`` for local
+       block devices. ``--data-size-kb * 1024`` must be a multiple of
+       this value.
+   * - ``--rounds N``
+     - ``1``
+     - Measurement rounds per operation.
+   * - ``--warmup-rounds N``
+     - ``1``
+     - Warmup rounds run before measurement; their results are
+       discarded.
+   * - ``--lookup-max-hit-rate F``
+     - ``0.0``
+     - Upper bound on the lookup hit rate, in ``[0, 1]``. The benchmark
+       requests ``floor(N * rate)`` keys from the
+       potentially-existing range and ``N - hit`` keys from a
+       guaranteed-non-existent range, where ``N`` is the total number
+       of lookup keys. The actual hit rate may be lower if those keys
+       were never stored in this run.
+   * - ``--skip-verify`` / ``--no-skip-verify``
+     - ``--skip-verify``
+     - Skip the store -> load round-trip data integrity check (the
+       default). Pass ``--no-skip-verify`` to enable verification on
+       the last measured round; this requires both ``store`` and
+       ``load`` to be exercised.
+   * - ``--only {lookup,store,load}``
+     - *(unset)*
+     - Run only the specified operation. When omitted, all three
+       operations are run in the order ``store -> lookup -> load``.
+   * - ``--flamegraph {on,off}``
+     - ``off``
+     - Capture a flame graph of the measured phases (``on``) or run the
+       benchmark normally (``off``). When ``on``, the benchmark profiles
+       itself and renders an SVG. Default ``off`` leaves benchmark
+       behavior unchanged. See
+       :ref:`Profiling / flame charts <lmcache-bench-l2-profiling>`.
+   * - ``--flamegraph-mode {on-cpu,off-cpu,wakeup,offwake,wall,gil}``
+     - ``on-cpu``
+     - Flame-graph mode for ``--flamegraph on``. ``on-cpu`` shows
+       where CPU time goes; ``off-cpu`` shows time blocked on I/O /
+       locks (best for I/O-bound adapters); ``offwake`` adds the waker
+       stack to each blocked stack; ``wakeup`` shows the stacks doing
+       the waking. ``wall`` and ``gil`` (``py-spy``) split the chart
+       per thread: wall-clock time, and time holding the interpreter
+       lock.
+   * - ``--flamegraph-output PATH``
+     - *(auto)*
+     - SVG output path. Default:
+       ``/tmp/lmcache_bench_flames/<adapter>.<mode>.svg``.
+   * - ``--flamegraph-scripts-dir DIR``
+     - *(~/FlameGraph)*
+     - Directory with the FlameGraph scripts (``flamegraph.pl``,
+       ``stackcollapse-perf.pl``).
+
+
+Adapter JSON spec
+~~~~~~~~~~~~~~~~~
+
+The ``--l2-adapter`` JSON is parsed by
+``lmcache.v1.distributed.l2_adapters.config.parse_args_to_l2_adapters_config``,
+the same entry point LMCache uses everywhere else. The minimum required
+field is ``type``; all remaining fields are forwarded to the adapter
+implementation as keyword arguments.
+
+Example for the local-filesystem adapter:
+
+.. code-block:: json
+
+   {
+     "type": "fs",
+     "base_path": "/data/lmcache-bench",
+     "relative_tmp_dir": "tmp",
+     "read_ahead_size": null,
+     "use_odirect": false
+   }
+
+See the source under ``lmcache/v1/distributed/l2_adapters/`` for the
+full list of adapter types and their accepted fields.
+
+
+Example output
+~~~~~~~~~~~~~~
+
+Per-round progress (suppressed by ``-q``):
+
+.. code-block:: text
+
+   ============================================================
+   L2 Adapter Benchmark
+   ============================================================
+     Adapter config         : FSL2AdapterConfig
+     L2 adapter JSON        : {"type":"fs","base_path":"/data/lmcache-bench","relative_tmp_dir":"tmp"}
+     Keys / submit          : 32
+     In-flight / round      : 3
+     Keys / round           : 96
+     Data size / key        : 256 KB
+     Data / round           : 24.00 MB
+     Rounds                 : 1 (+ 1 warmup)
+     Lookup max hit rate    : 0.00%
+   ============================================================
+
+   [Init] Creating adapter...
+   [Init] Adapter created successfully (FSL2Adapter).
+
+   [Store] Running 1 warmup + 1 measurement rounds...
+     [Store] Round 1: 47.83 ms, success_keys=96/96
+     [Store] Round 2: 46.19 ms, success_keys=96/96
+
+   [Lookup] Running 1 warmup + 1 measurement rounds...
+     [Lookup] Round 1:  5.36 ms, found=96/96
+     [Lookup] Round 2:  5.03 ms, found=96/96
+
+   [Load] Running 1 warmup + 1 measurement rounds...
+     [Load] Round 1: 18.15 ms, loaded=96/96
+     [Load] Round 2: 17.63 ms, loaded=96/96
+
+Final summary (one section per exercised operation):
+
+.. code-block:: text
+
+   ====== L2 Adapter Benchmark Result (FSL2Adapter) =======
+   ----------------------- Configuration -------------------
+   Adapter:                          FSL2Adapter
+   Keys / submit:                    32
+   In-flight / round:                3
+   Data size / key (KB):             256
+   Measurement rounds:               1
+   Warmup rounds:                    1
+   Lookup max hit rate:              0.0
+   --------------------------- Store -----------------------
+   Operation:                        Store
+   Rounds:                           1
+   Rounds timed out:                 0
+   Keys / round:                     96
+   Total keys:                       96
+   Total success:                    96
+   Duration avg (ms):                46.19
+   ...
+   Throughput avg (MB/s):            519.62
+   Avg ops/s:                        2078.50
+   Avg latency / key (ms):           0.481
+   --------------------------- Lookup ----------------------
+   ...
+   ---------------------------- Load -----------------------
+   ...
+   =========================================================
+
+Each operation section reports per-round duration statistics
+(avg / min / max / p50 / p99 / std), aggregate throughput
+(``avg_throughput_mbps`` -- 0 for ``Lookup`` since it has no payload),
+average key-rate (``avg_ops_per_sec``), and a per-key latency.
+
+``Rounds`` counts every round that was issued, and ``Rounds timed out``
+counts the subset that hit the wait timeout. A round that times out has
+no meaningful duration, so it is excluded from all duration and
+throughput statistics; the keys it issued still count toward
+``Total keys``, and the keys that did succeed before the timeout still
+count toward ``Total success``. When ``Rounds timed out`` is non-zero,
+read the duration and throughput figures as describing the rounds that
+completed.
+
+For ``Lookup``, three additional fields are reported when
+``--lookup-max-hit-rate`` is non-zero or some keys were found:
+
+* ``Expected max hit rate`` -- the configured upper bound.
+* ``Expected hit keys`` -- ``floor(total_keys * rate)``, scaled for
+  the measured rounds only.
+* ``Actual hit rate`` -- the measured hit rate over the kept rounds.
+
+
+Round-trip verification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+When ``--no-skip-verify`` is passed and both ``store`` and ``load`` were
+run, the benchmark compares the load buffers from the last measured
+round against the byte pattern that ``store`` wrote (see
+``make_memory_objects`` in
+``lmcache/cli/commands/bench/l2_adapter_bench/data.py``):
+
+.. code-block:: text
+
+   [Verify] Checking store -> load data integrity for last measured round...
+   [Verify] OK
+
+Verification is **off** by default because the stricter byte pattern
+requires both the store and load object batches to stay resident so the
+loaded data can be compared against the original store pattern.
+
+
+.. _lmcache-bench-l2-profiling:
+
+Profiling / flame charts
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When ``--flamegraph on`` is passed, the benchmark profiles **its own
+process** (the L2 adapter driven by this microbenchmark's synthetic load)
+and renders a flame graph of the measured phases (to profile a separate
+server or a real process instead, use
+:doc:`lmcache tool flamegraph </cli/tool>`):
+
+.. code-block:: bash
+
+   lmcache bench l2 \
+       --l2-adapter '{"type":"fs","base_path":"/data/lmcache-bench"}' \
+       --rounds 300 --flamegraph on --flamegraph-mode on-cpu
+   #   [Profile] on-cpu recording started (pid=12345) -> .../FSL2Adapter.oncpu.svg
+   #   [Profile] wrote /tmp/lmcache_bench_flames/FSL2Adapter.oncpu.svg
+
+The ``--flamegraph-mode`` values, cost of recording, and tool / sysctl
+requirements are documented under
+:ref:`lmcache tool flamegraph <lmcache-flamegraph-modes>` (or pass several
+comma-separated to profile one benchmark run per mode, one SVG each). What is
+specific to ``bench l2``:
+
+* It **self-profiles**, so on CPython 3.12+ it activates the perf trampolines
+  itself and adapter functions resolve as ``py::<qualname>`` in the
+  ``on-cpu`` / ``off-cpu`` charts with no ``PYTHONPERFSUPPORT`` needed (an
+  attached server cannot). Trampolines cost a few percent, so treat a
+  profiled run's timings as indicative.
+* The recorder runs as a child of the benchmark, so ``wall`` / ``gil`` need
+  ``kernel.yama.ptrace_scope`` at ``0`` (not the attach-mode permissions).
+* Recording covers only the measured work, so use a large ``--rounds``; too
+  short a run captures no samples.
+
+The SVG is written to ``--flamegraph-output`` (default
+``/tmp/lmcache_bench_flames/<adapter>.<mode>.svg``).
+
+
+Exit codes
+~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 85
+
+   * - Code
+     - Meaning
+   * - ``0``
+     - All requested operations completed and (when enabled) the
+       round-trip verification passed.
+   * - ``1``
+     - Adapter creation failed, round-trip verification failed, or
+       an operation hit a fatal error (e.g. all rounds timed out).
+   * - ``2``
+     - Invalid invocation: the ``--l2-adapter`` JSON / ``L2_ADAPTER_JSON``
+       env var was missing or could not be parsed, an option value was
+       invalid, or ``--flamegraph on`` was requested but the profiling
+       toolchain is unavailable.
+
+
+.. _lmcache-bench-quality:
+
+quality
+-------
+
+The ``lmcache bench quality`` commands check whether a serving engine
+change -- quantization, KV cache compression, post-training, or another
+engine or model -- changes the answers compared with a reference. They send
+the same QA prompts to a *reference* engine (for example the original model)
+and to a *candidate* engine (for example a quantized version of it), score
+both against gold answers, and print one verdict -- ``PASS``, ``FAIL``,
+``UNDERPOWERED`` or ``INVALID`` -- that CI can gate on. The work is split
+in two stages that share a *results directory*:
+
+.. code-block:: bash
+
+   lmcache bench quality run [options]          # send prompts to arms, save answers
+   lmcache bench quality analyze RESULTS_DIR    # score saved answers, print verdict
+
+``run`` takes one or more arms, so the engines never need to be up at the
+same time: run each arm against its own engine (for example one GPU server
+per CI job) into the same directory, then run ``analyze`` on any machine --
+it needs no engine, tokenizer or dataset, and can be rerun with another
+metric or tolerance without rerunning an arm.
+
+:ref:`rag-qa-quality <bench-rag-qa-quality>` scores one stack per run.
+``bench quality`` adds what a comparison needs: byte-identical prompts for
+every arm (checked across runs), a record of how each passage got into the
+cache, a noise floor from repeated reference runs, optionally a check that
+KV blending actually happened, and a statistical verdict.
+
+The commands do not launch engines. Start each one yourself, from an empty
+cache (see the note under :ref:`Quality quick start <bench-quality-quick-start>`).
+
+
+What bench quality does
+~~~~~~~~~~~~~~~~~~~~~~~
+
+**Arms.** Each arm is an OpenAI-compatible engine that accepts requests for
+the ``--model`` name; to compare two models, serve the candidate under that
+name (with vLLM, ``--served-model-name``). Pass any of the arms to ``run``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 25 60
+
+   * - Arm
+     - ``run`` flag
+     - Engine
+   * - ``reference``
+     - ``--reference-url``
+     - The stack every other arm is judged against, for example the
+       original model on vLLM with prefix caching **off**. Runs
+       ``--reference-repeats`` times (default 2); how often it disagrees
+       with itself is the *flip rate*, the noise floor.
+   * - ``candidate``
+     - ``--candidate-url``
+     - The stack under test: for example a quantized, compressed or
+       post-trained model, a KV cache optimization, or another engine.
+   * - ``control``
+     - ``--control-url`` (optional)
+     - A second stack expected to answer like the reference, for example
+       the reference with prefix caching on (it reuses KV only at its
+       original position). A gap points at the harness or the engine rather
+       than the candidate. Reported only; it does not set the verdict.
+
+``analyze`` needs a reference and a candidate arm in the directory; the
+control arm is reported when present. Within a ``run``, arms run one after
+another, and questions run one at a time.
+
+**Reuse scenarios.** Caching arms first receive *store requests*
+(``max_tokens=1``) that put the passages in the cache, then the measured
+prompts:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 82
+
+   * - ``--scenario``
+     - What is stored, and how it is reused
+   * - ``independent``
+     - Each distinct passage is stored alone, then measured together with the
+       question's other passages -- the basic RAG case.
+   * - ``reordered``
+     - Each question's passages are stored together, then measured in a
+       seeded new order -- reuse at a different position *and* next to
+       different neighbors.
+   * - ``concatenated``
+     - Questions' contexts (their passages, in order) are concatenated, in a
+       seeded shuffle, into units of at least ``--min-unit-tokens`` and
+       stored without the system prompt or any padding. Each question is
+       then measured over its own context -- reuse of a whole context
+       computed after unrelated ones, at a new position.
+
+Prompts are chunk-aligned like ``rag-qa-quality``'s, so for a caching
+candidate set ``--chunk-size`` to its chunk size. ``--filler`` picks what pads
+each passage to whole chunks. The default, ``dots``, frames it as
+``Passage <id>: … end of passage <id>`` with a repeated `` .`` in between.
+``words`` keeps the random-word padding of earlier implementations, as
+``rag-qa-quality`` still pads. The prompt asks for the answer between
+``<answer>`` tags whatever the filler. Before any request, every prompt is
+rendered with the model's chat template and each passage must
+land on a chunk boundary with identical tokens wherever it appears; otherwise
+``run`` lists the misplaced passages and exits 2.
+
+**Blend metrics.** For a candidate served through the LMCache blend server,
+which reuses cached KV at new positions, a silent fallback to recompute would
+score like the reference and pass. With ``--capture-blend-metrics URL`` on the
+candidate's ``run``, the blend server's ``lmcache_blend_lookup_*`` counters
+are read around every question (once before any arm runs, so an unreachable
+endpoint fails fast; a failed read is retried before it stops the run). The
+*blend share* is the share of looked-up tokens served by blending at a new
+position. The verdict is ``INVALID`` if the share is below
+``--min-blend-share``, over the whole run or in any window of 10 consecutive
+questions (which catches a run that stopped blending partway).
+
+For ``--scenario concatenated``, part of the expected reuse can arrive as an
+exact prefix, so the blend share is reported but not gated. Instead, the
+tokens served from cache (prefix and blended) must reach
+``--min-reuse-ratio`` (default 0.8) of the plan's expected reuse, over the
+whole run and in every 10-question window. A candidate that fell back to
+recompute reuses nothing and fails this check.
+
+With ``--enable-segmented-prefix`` on the blend server, prefix chunks loaded
+past an L2 load failure are reused at their original positions. That is not
+blending, so those tokens lower the blend share; the summary reports them as
+*segmented-prefix tokens*, and an ``INVALID`` reason names them, so a low
+share caused by L2 trouble is not mistaken for blending being off.
+
+**Verdict.** Δ is the mean candidate score minus the mean score of the first
+reference run, and SE is the standard error of the per-question differences.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 82
+
+   * - Verdict
+     - Condition
+   * - ``INVALID``
+     - The runs cannot be compared: blend metrics were captured and the
+       blend share is below ``--min-blend-share`` (for ``concatenated``,
+       observed reuse is below ``--min-reuse-ratio`` of expected), an arm
+       run had no
+       successful request (for example an unreachable engine), a store
+       request failed, or more than 5% of questions are unscored. The summary lists the reasons.
+   * - ``PASS``
+     - \|Δ\| ≤ ``--tolerance`` (default 0.05, i.e. 5 points).
+   * - ``FAIL``
+     - \|Δ\| > tolerance **and** \|Δ\| > 2·SE.
+   * - ``UNDERPOWERED``
+     - Otherwise: the difference may be noise. The summary says roughly how
+       many questions would settle it.
+
+The check is two-sided: a candidate that scores well *above* the reference
+also fails. A change meant to preserve answers should not improve them, so a
+large gain points at the setup (for example a misconfigured reference) as
+much as a loss does.
+
+Each question the candidate loses is tagged ``abstention`` (the model said the
+passages lack the answer), ``empty`` (no parsed answer), ``wrong_value`` (it
+answered with another string from the prompt) or ``wording``.
+
+
+Scoring
+~~~~~~~
+
+``analyze --verdict-metric`` picks how answers are scored. It defaults to
+``judge`` when ``--judge-url`` is given and to ``match`` otherwise.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 88
+
+   * - Metric
+     - Description
+   * - ``judge``
+     - An LLM judge scores each answer with RAGAS ``AnswerAccuracy`` (0 to 1
+       in steps of 0.25). This is the reference metric: use it for numbers
+       you report. The metric is built in, so ragas need not be installed;
+       its scores match ragas 0.4.3 run on the same judge model.
+   * - ``match``
+     - Judge-free: the answer states a gold answer, by normalized phrase
+       match or by every gold number within 0.5% (``$11.588 billion``
+       matches ``$11588.00``). Good for CI and quick checks; it can
+       understate the size of a loss.
+   * - ``f1``
+     - SQuAD token F1, as in ``rag-qa-quality``. Kept for continuity; not
+       recommended for the verdict.
+
+**Judge endpoint.** Any OpenAI-compatible server works. Serve the judge from
+a separate deployment, not from the engines under test -- with the stages
+split, it can be started after the arms' engines are gone. As in a RAGAS
+hand-off, the judge compares each answer with the question's *first* gold
+answer only, while ``match`` accepts any of them; on datasets with answer
+aliases (e.g. MuSiQue), a correct alias can rate lower under the judge.
+Judgments are cached in the results directory's ``judge_cache.jsonl`` and
+reused by every later ``analyze`` of it. The cache trusts the judge model
+name: delete it after changing what serves that name (provider,
+quantization, engine version). An unreadable line, such as a partial last
+line from a killed run, is skipped and re-judged.
+
+* **Judge sanity check.** Before scoring, the judge rates a right and a wrong
+  answer to a sanity-check question, and ``analyze`` stops unless it rates
+  them 4 and 0. Ratings are read as ragas reads them -- the smallest digit
+  0-4 anywhere in the reply -- so a thinking model served without a
+  reasoning parser (vLLM ``--reasoning-parser``) has its reasoning read as a
+  rating of 0, which would zero every arm and pass silently.
+* **Failures.** Transient request errors are retried with backoff. A judge
+  that still fails mid-scoring stops ``analyze``; rerunning it only judges
+  what is not cached.
+* **Unscored questions.** A question that some arm got no rating for is left
+  out and reported as unscored. If more than 5% of questions are unscored,
+  the verdict is ``INVALID``.
+
+.. note::
+
+   Only short-answer QA is supported (``--task qa``). A dataset whose median
+   gold answer is longer than 50 words, such as a summarization set, is
+   refused, because the prompt, answer parsing and loss tags are QA-specific.
+
+
+.. _bench-quality-quick-start:
+
+Quality quick start
+~~~~~~~~~~~~~~~~~~~
+
+``bench quality run`` loads the model's tokenizer to align passages to cache
+chunks, so it needs ``transformers``, which the ``lmcache-cli`` package does
+not install (``analyze`` does not need it):
+
+.. code-block:: bash
+
+   pip install transformers
+
+**Everything up at once.** This compares an FP8-quantized model with the
+original. Serve the original on port 8000 as the reference and the quantized
+model on port 8001 as the candidate, under the original's name so both arms
+accept the same requests, with a judge on another host:
+
+.. code-block:: bash
+
+   vllm serve Qwen/Qwen3-8B --port 8000 --no-enable-prefix-caching
+   vllm serve Qwen/Qwen3-8B-FP8 --port 8001 --no-enable-prefix-caching \
+       --served-model-name Qwen/Qwen3-8B
+
+.. code-block:: bash
+
+   lmcache bench quality run \
+       --reference-url http://localhost:8000 \
+       --candidate-url http://localhost:8001 \
+       --model Qwen/Qwen3-8B \
+       --dataset hotpotqa --limit 200
+   # prints: results directory: quality_results/20261019-103005
+
+   lmcache bench quality analyze quality_results/20261019-103005 \
+       --judge-url http://judge-host:8000 --judge-model openai/gpt-oss-120b
+
+Drop the ``--judge-*`` flags for a judge-free analysis scored with ``match``.
+For a candidate served through the LMCache blend server, add
+``--capture-blend-metrics`` with its metrics URL and set ``--chunk-size`` to
+its chunk size (see Blend metrics above).
+
+**One engine at a time** (for example one GPU server, or one CI job per
+arm). Give every ``run`` the same workload flags and ``--output-dir``:
+
+.. code-block:: bash
+
+   WORKLOAD="--model Qwen/Qwen3-8B --dataset hotpotqa --limit 200"
+
+   # Job 1: reference engine up
+   lmcache bench quality run --reference-url http://gpu0:8000 $WORKLOAD --output-dir out
+   # Job 2: reference engine down, candidate engine up
+   lmcache bench quality run --candidate-url http://gpu0:8000 $WORKLOAD --output-dir out
+   # Job 3: engines down, judge up (or no judge)
+   lmcache bench quality analyze out --judge-url http://gpu0:8000
+
+Every ``run`` builds the plan and checks it against the directory's
+``plan.json`` before sending a request, so an arm run with other settings,
+or after the tokenizer, dataset revision or prompt code changed, is refused
+instead of mixed in. Rerunning an arm replaces that arm's earlier passes.
+
+**Reusing a saved reference.** When the reference stack has not changed, copy
+its files from an earlier results directory into a fresh one and run only
+the candidate arm:
+
+.. code-block:: bash
+
+   mkdir new && cp saved/plan.json saved/manifest.jsonl saved/*reference* new/
+   lmcache bench quality run --candidate-url http://gpu0:8000 $WORKLOAD --output-dir new
+   lmcache bench quality analyze new
+
+The candidate ``run`` refuses the directory if its plan differs from the saved
+one. Each arm records its engine version, lmcache version and timestamps,
+which ``analyze`` prints and stores in ``summary.json`` -- check them to see
+how old a reused reference is. A reused arm keeps the answers as its own
+lmcache version extracted them.
+
+.. note::
+
+   Start each caching arm from an empty cache: restart the engine (and any
+   cache server behind it) before its ``run``. Otherwise the arm reuses KV
+   from an earlier run, and what is measured is no longer the chosen
+   scenario.
+   Running one arm per engine lifetime, as above, satisfies this.
+
+**Datasets** are the same as for :ref:`rag-qa-quality <bench-rag-qa-quality>`:
+``musique``, ``hotpotqa``, or a local QA file, including the RAGAS hand-off
+fields (``user_input``, ``retrieved_contexts``, ``reference``). Supporting
+passages are taken from the dataset's own markers when it has them (MuSiQue
+``is_supporting``, HotpotQA ``supporting_facts``, ``context_metadata[].gold``),
+otherwise from which passage contains a gold answer.
+
+**Reasoning models.** As with ``rag-qa-quality``, pass the chat-template
+setting with ``--template-kwargs`` (for example ``reasoning_effort=low``) and
+leave ``--max-output-tokens`` enough room for the reasoning and the answer.
+
+
+Quality run options
+~~~~~~~~~~~~~~~~~~~
+
+Pass at least one arm. Every ``run`` into one results directory must use the
+same workload flags (``--model`` through ``--seed``).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--reference-url``
+     - *(unset)*
+     - Engine serving the reference, for example the original model (vLLM,
+       prefix caching off).
+   * - ``--candidate-url``
+     - *(unset)*
+     - Engine serving the candidate under test, for example a quantized
+       model.
+   * - ``--control-url``
+     - *(unset)*
+     - Engine serving an optional control, for example the reference with
+       prefix caching on. Reported alongside; does not set the verdict.
+   * - ``--capture-blend-metrics``
+     - *(unset)*
+     - For a candidate served through the LMCache blend server: its
+       Prometheus ``/metrics`` URL, read during the candidate pass; needs
+       ``--candidate-url``. Without it, blend engagement is not checked and
+       cannot make the verdict ``INVALID``.
+   * - ``--reference-repeats``
+     - 2
+     - Reference passes; needs ``--reference-url``. Two or more report the
+       flip rate.
+   * - ``--model``
+     - *required*
+     - Served model name, sent to every arm; its tokenizer is used to align
+       passages to chunks. Serve a different candidate model under this name.
+   * - ``--task``
+     - ``qa``
+     - Task type of the dataset. Only ``qa`` is supported.
+   * - ``--dataset``
+     - *required*
+     - ``musique``, ``hotpotqa``, or a path to a local ``.json``,
+       ``.jsonl`` or ``.parquet`` QA file.
+   * - ``--limit``
+     - 0
+     - Questions to measure, in dataset order (0 = all).
+   * - ``--scenario``
+     - ``independent``
+     - ``independent``, ``reordered`` or ``concatenated`` (see above).
+   * - ``--min-unit-tokens``
+     - 8192
+     - ``concatenated`` only: minimum tokens per stored unit. Units of about
+       one context make most reuse an exact prefix; the default holds 3--6
+       contexts on HotpotQA and FinanceBench.
+   * - ``--chunk-size``
+     - 256
+     - LMCache chunk size. For a caching candidate, match its chunk size.
+   * - ``--max-output-tokens``
+     - 2048
+     - Token budget per answer, reasoning included.
+   * - ``--template-kwargs``
+     - *(unset)*
+     - Chat-template variable as ``KEY=VALUE``, repeatable.
+   * - ``--filler``
+     - ``dots``
+     - What pads passages to whole chunks: ``dots`` or ``dashes`` (a repeated
+       `` .`` / `` -`` inside a ``Passage <id>:`` label and an
+       ``end of passage <id>`` marker), or ``words`` (random single-token
+       words, as ``rag-qa-quality`` pads).
+   * - ``--seed``
+     - 42
+     - Seed for the ``words`` filler and the ``reordered`` permutation.
+   * - ``--output-dir``
+     - *(new dir)*
+     - Results directory, used as given; runs of different arms into it are
+       analyzed together. Without it, a new ``quality_results/<timestamp>/``
+       is created and printed.
+
+
+Quality analyze options
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``RESULTS_DIR``
+     - *required*
+     - The directory ``run`` wrote the arms into.
+   * - ``--verdict-metric``
+     - *(see Scoring)*
+     - ``judge``, ``match`` or ``f1``.
+   * - ``--tolerance``
+     - 0.05
+     - Acceptable candidate-vs-reference score difference, in either direction,
+       in score units.
+   * - ``--min-blend-share``
+     - 0.3
+     - When blend metrics were captured (``run --capture-blend-metrics``):
+       minimum blend share, overall and per 10-question window. Not applied
+       to ``concatenated``.
+   * - ``--min-reuse-ratio``
+     - 0.8
+     - ``concatenated`` with blend metrics captured: minimum observed
+       reused tokens (prefix and blended) over the plan's expected reuse,
+       overall and per 10-question window.
+   * - ``--judge-url``
+     - *(unset)*
+     - OpenAI-compatible endpoint serving the judge model.
+   * - ``--judge-model``
+     - the arms' ``--model``
+     - Judge model name.
+   * - ``--judge-api-key``
+     - ``$LMCACHE_JUDGE_API_KEY``
+     - API key for the judge endpoint (``EMPTY`` when unset).
+   * - ``--judge-max-tokens``
+     - 4096
+     - Completion budget per judge call, reasoning included.
+   * - ``--judge-concurrency``
+     - 8
+     - Answers judged at once.
+
+
+Quality output
+~~~~~~~~~~~~~~
+
+``run`` prints each pass's answered, empty and store-failure counts and the
+``analyze`` command to run next. ``analyze`` prints where each arm came from,
+then each arm's mean score, its difference from the first reference run, and
+the verdict:
+
+.. code-block:: text
+
+   bench quality analyze: 100 questions, 3 passes, metric=judge
+   reference_1: http://gpu0:8000 (engine 0.11.0, lmcache 0.4.0, finished 2026-10-19T10:41:12-05:00)
+   ...
+   arm              score    delta    2*SE  empty  abstain
+   reference_1      0.905                       0        1
+   reference_2      0.900   -0.005   0.019      0        1
+   candidate        0.768   -0.137   0.064      0        9
+   reference flip rate: 0.030
+   blend share: 0.912 (min window 0.874), stale chunks: 0, fingerprints registered: 4180
+   evidence passages identified: dataset 100, answer_string 0, none 0
+   verdict: FAIL
+
+The results directory holds the files below; every field of every file is
+described in :doc:`bench_quality_results`.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 60
+
+   * - File
+     - Written by
+     - Contents
+   * - ``plan.json``
+     - first ``run``
+     - The plan every arm receives: the workload settings, every store and
+       measured prompt, each question with its gold answers and passages,
+       and the ``plan_fingerprint`` every arm must match.
+   * - ``manifest.jsonl``
+     - first ``run``
+     - The reuse manifest: for every passage of every question, where it was
+       stored, where it was measured, whether it holds the evidence, and
+       which earlier questions also held it (``measured_earlier_in``). A
+       caching candidate caches measured prompts too, so a recurring passage may be
+       reused from an earlier question's prompt rather than from its store
+       request; ``summary.json`` reports the share as
+       ``measured_earlier_share``, and the terminal summary prints it when it
+       is not zero.
+   * - ``arm_<label>.json``
+     - ``run``
+     - One per pass: URL, engine and lmcache versions, start and finish
+       times, run-level blend counters (when captured), store failures, and the plan
+       fingerprint. Written last: answers without it are ignored.
+   * - ``answers_<label>.jsonl``
+     - ``run``
+     - Raw responses per pass: parsed answer, TTFT, output tokens and blend
+       counter deltas (when captured).
+   * - ``rows.jsonl``
+     - ``analyze``
+     - One row per question: gold answers, each arm's answer and score, loss
+       tag, whether the reference flipped, blend share and evidence. With
+       the judge, also each arm's ``match`` score as a cross-check.
+   * - ``summary.json``
+     - ``analyze``
+     - Verdict (with ``invalid_reasons``), metric, tolerance, Δ, SE, flip
+       rate, engagement, per-arm counts and provenance, evidence sources,
+       judge model, unscored questions, ``plan_fingerprint`` and
+       ``run_fingerprint``.
+   * - ``judge_cache.jsonl``
+     - ``analyze``
+     - Judge ratings, reused by later ``analyze`` runs of the directory.
+
+Two summaries are comparable **only when their** ``run_fingerprint``
+**values match**. It covers the model, dataset, task, ``--limit``, scenario,
+chunk size, output budget, template kwargs, seed, verdict metric, judge
+model, and every measured prompt.
+
+.. toctree::
+   :hidden:
+
+   bench_quality_results
+
+
+Quality exit codes
+~~~~~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 85
+
+   * - Code
+     - Meaning
+   * - ``0``
+     - ``run``: every pass finished and is fit to compare. ``analyze``: the
+       verdict is ``PASS`` or ``UNDERPOWERED``.
+   * - ``1``
+     - ``run``: a pass had no successful request or failed store requests,
+       so the verdict will be ``INVALID`` (its files are still saved).
+       ``analyze``: the verdict is ``FAIL`` or ``INVALID``. Either: the
+       command stopped on an error, for example an unreachable judge or
+       blend-server metrics endpoint, a refused dataset, or an option value
+       outside its range (such as ``--tolerance 2`` or ``--limit -1``).
+   * - ``2``
+     - Invalid invocation or results directory, rejected before anything
+       runs: a required flag is missing, a value is not one of a flag's
+       choices, or a number does not parse; or the results directory does
+       not fit -- ``run``'s plan differs from the directory's ``plan.json``,
+       or ``analyze`` finds no ``plan.json``, lacks the reference or candidate
+       arm (all missing arms are named), or finds an arm from another plan
+       or schema version. Nothing is written, so CI can tell a broken
+       pipeline from a quality verdict.
+
+.. _lmcache-bench-trace-analyze:
+
+trace-analyze
+-------------
+
+The ``lmcache bench trace-analyze`` command answers "what hit rate would
+this workload get at cache size X with chunk size Y?" from a recorded
+request trace, without a GPU or a running server. It requires the full
+``lmcache`` install (the replay uses the server's token hasher and
+CacheBlend matcher).
+
+.. code-block:: bash
+
+   lmcache bench trace-analyze --input FILE [FILE ...] [options]
+
+
+Collecting a trace
+~~~~~~~~~~~~~~~~~~
+
+Start the MP server with ``--enable-token-trace``. Each lookup then
+emits a zero-duration ``mp.request.trace`` span under the request's root
+span, carrying ``lmcache.model``, ``lmcache.input_ids`` (the prompt token
+ids) and ``session_id``; the span's start time is the lookup timestamp.
+A request the engine looks up again (for example after preemption) emits
+one span per lookup; the analyzer keeps only its earliest span.
+
+This is the ``lmcache`` trace format, the default value of
+``--trace-format``; its contract is in :ref:`trace-analyze-formats`.
+When no span matches, the tool reports what the files did hold.
+
+Persist the spans with the Collector's ``file`` exporter. Starting from
+``examples/observability``, add the exporter to the traces pipeline in
+``otel-collector.yml``:
+
+.. code-block:: yaml
+
+   exporters:
+     file/traces:
+       path: /var/log/otel/lmcache-traces.jsonl
+
+   service:
+     pipelines:
+       traces:
+         receivers: [otlp]
+         exporters: [otlp/tempo, file/traces]
+
+The collector image has no writable directory of its own and runs as
+user ``10001``, so the exporter cannot create that path until a host
+directory is mounted there. Create one the collector can write to and
+mount it in ``docker-compose.yml``:
+
+.. code-block:: bash
+
+   mkdir -p otel-data && chmod a+w otel-data
+
+.. code-block:: yaml
+
+   services:
+     otel-collector:
+       volumes:
+         - ./otel-collector.yml:/etc/otel-collector.yml:ro
+         - ./otel-data:/var/log/otel
+
+The file then appears as ``otel-data/lmcache-traces.jsonl`` on the host.
+It holds OTLP JSON, one export batch per line. Prompt token ids are
+only exported when ``--enable-token-trace`` is set; treat the file as
+sensitive.
+
+
+.. _trace-analyze-formats:
+
+Trace formats
+~~~~~~~~~~~~~
+
+``--trace-format`` names the producer whose records the input holds.
+Whatever the producer and its collector pipeline emit, the analyzer needs
+only this from each request, in order of importance:
+
+* **token ids**, as the engine prefilled them with the chat template
+  applied. The replay works on nothing else.
+* **a timestamp**, which fixes the replay order.
+* **a request id**, to collapse a request that was recorded more than
+  once. The LMCache server emits one span per lookup rather than per
+  request, and the engine looks a request up again after preemption, so
+  that format needs it. A producer that records each request once can use
+  any unique value.
+* **a model name**, only for ``--model``; it may be empty.
+
+How those are packaged is the producer's choice: OTLP spans, OTLP logs or
+flat JSON lines all work, as long as the file is one JSON value per
+line. Each format is a small adapter that turns a parsed line into
+records, kept honest by a sample file under
+``tests/tools/data/trace_formats/`` that the test suite replays. A new
+format adds the adapter, its sample file and an entry here.
+
+lmcache
+^^^^^^^
+
+The MP server's token-trace span, as the Collector's ``file`` exporter
+writes it with no processing. Sample:
+``tests/tools/data/trace_formats/lmcache.jsonl``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 18 56
+
+   * - Field
+     - Type
+     - Meaning
+   * - span ``name``
+     - string
+     - ``mp.request.trace``. Spans with any other name are ignored.
+   * - ``startTimeUnixNano``
+     - int64
+     - Lookup time; sets the replay order.
+   * - ``session_id``
+     - string
+     - Request id. A request looked up more than once keeps its earliest
+       span.
+   * - ``lmcache.model``
+     - string
+     - Model name as the engine reports it; ``--model`` filters on it.
+   * - ``lmcache.input_ids``
+     - int64 array, or string
+     - Prompt token ids after the chat template, as the engine prefilled
+       them: the OTLP integer array as emitted, or one JSON string of the
+       same integers as a collector ``transform`` may write it.
+
+Everything else on a line (the resource block, the span's trace, span
+and parent ids, kind, flags and status) is OTLP packaging and is ignored.
+One line of the sample, pretty-printed with the token array shortened:
+
+.. code-block:: json
+
+   {"resourceSpans": [{
+     "resource": {"attributes": [
+       {"key": "service.name", "value": {"stringValue": "lmcache"}}]},
+     "scopeSpans": [{
+       "scope": {"name": "lmcache_mp.server"},
+       "spans": [{
+         "name": "mp.request.trace",
+         "startTimeUnixNano": "1792617070080115968",
+         "endTimeUnixNano": "1792617070080115968",
+         "attributes": [
+           {"key": "session_id",
+            "value": {"stringValue": "chatcmpl-ab53be3e1411e41a-81c1fd35"}},
+           {"key": "lmcache.model",
+            "value": {"stringValue": "Qwen/Qwen3-1.7B"}},
+           {"key": "lmcache.input_ids",
+            "value": {"arrayValue": {"values": [
+              {"intValue": "151644"}, {"intValue": "872"}, {"intValue": "198"}]}}}
+         ]}]}]}]}
+
+dynamo
+^^^^^^
+
+The Dynamo frontend's ``request_payload`` records, sent as OTLP logs by its
+request trace ``otel`` sink (``DYN_REQUEST_TRACE_RECORDS=request_payload``,
+``DYN_REQUEST_TRACE_SINKS=otel``) and written by the Collector's ``file``
+exporter with no processing. Sample:
+``tests/tools/data/trace_formats/dynamo.jsonl``.
+
+Each record gives the request id (``rid``), the model, the arrival time
+(``timeUnixNano``) and the chat request (``payload.request``). The request is
+text, not token ids: its tools, then each message's role and text, are packed
+four UTF-8 bytes per integer, about one per token.
+
+
+What it does
+~~~~~~~~~~~~
+
+Requests are sorted by timestamp and replayed, for every ``(chunk size,
+capacity)`` pair in the grid, through one LRU cache keyed by chained chunk
+hashes (the trailing partial chunk is never cached):
+
+* **Prefix hit tokens** -- the leading run of chunks already in the cache,
+  as the prefix lookup counts them. Hits are touched, every chunk of the
+  request is inserted, and the least recently used chunks are evicted
+  over capacity.
+* **Non-prefix (CacheBlend) hit tokens** -- each stored request is also
+  registered with the real ``BlendTokenRangeMatcher``; each lookup probes
+  it and the matches are reconciled like the blend lookup: matches inside
+  the prefix are dropped, then a non-overlapping subset of the rest is
+  kept. Evicted chunks are removed from the matcher. Only matched tokens
+  are reported; CacheBlend's recompute is not modelled.
+
+Capacity is a token budget, since the trace carries no KV shape.
+
+
+Quick start
+~~~~~~~~~~~
+
+.. code-block:: bash
+
+   lmcache bench trace-analyze \
+     --input /var/log/otel/lmcache-traces.jsonl \
+     --chunk-size 256 512 \
+     --capacity 64k 256k 1M \
+     --html trace_analysis.html
+
+The HTML report is self-contained: two sliders (token budget, chunk
+size) select a precomputed grid cell and show its prefix and non-prefix
+hit rates with their token counts, request count and token totals, plus
+a table of every budget at the selected chunk size. Each cell is a full
+replay, so the slider steps over the capacities given; pass more for a
+smoother sweep. A plain-text summary with the same
+grid goes to stdout (``--format json`` for machine-readable output).
+
+
+Options
+~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Option
+     - Description
+   * - ``-i``, ``--input FILE [FILE ...]``
+     - OTLP JSON file(s) written by the Collector's ``file`` exporter.
+       Required.
+   * - ``--html FILE``
+     - Where to write the HTML report (default ``trace_analysis.html``).
+   * - ``--chunk-size TOKENS [TOKENS ...]``
+     - Chunk size(s) to simulate (default ``256``).
+   * - ``--capacity TOKENS [TOKENS ...]``
+     - Cache token budgets to simulate. ``K`` and ``M`` suffixes are
+       binary (``64k``, ``1M``). Default: half-octave steps from 4096
+       tokens up to the trace size.
+   * - ``--trace-format {lmcache}``
+     - Producer format of the input spans. ``lmcache`` is the MP
+       server's ``mp.request.trace`` span (default).
+   * - ``--trace-format {dynamo}``
+     - ``dynamo`` is the Dynamo frontend's ``request_payload`` record.
+   * - ``--model NAME``
+     - Only analyze requests for this model name. Use it when one trace
+       mixes models, since the simulated cache is shared.

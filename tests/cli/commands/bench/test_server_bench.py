@@ -1,0 +1,1476 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for the ``lmcache bench server`` CLI command.
+
+Covers:
+- Sub-command registration under ``lmcache bench``
+- Argument registration and defaults
+- Pure helper functions (_build_token_ids, _make_key, _query_checksum)
+"""
+
+# Standard
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+import argparse
+import gc
+import json
+import threading
+import weakref
+
+# Third Party
+import msgspec
+import pytest
+import torch
+import zmq
+
+# First Party
+from lmcache.cli.commands.bench import BenchCommand
+from lmcache.cli.commands.bench.server_bench import client as client_module
+from lmcache.cli.commands.bench.server_bench.buffers import KVCacheBuffers
+from lmcache.cli.commands.bench.server_bench.helpers import (
+    _build_token_ids,
+    _make_key,
+    _poll_prefetch_status,
+    _query_checksum,
+    _send_lookup,
+)
+from lmcache.v1.kv_layer_groups import (
+    DTYPE_MAP,
+    KVLayerGroupInfo,
+    parse_kvcache_shape_spec,
+)
+from lmcache.v1.multiprocess.futures import MessagingFuture
+from lmcache.v1.multiprocess.token_codec import unpack_token_ids
+from lmcache.v1.multiprocess.transport.base import RequestClient
+from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
+from lmcache.v1.multiprocess.transport.zmq_impl.wire import decode_operation
+from lmcache.v1.platform.ops_types import PageBufferShapeDesc
+
+
+def _make_shape_desc(
+    *,
+    kv_size: int,
+    nl: int,
+    nb: int,
+    bs: int,
+    nh: int,
+    hs: int,
+    dtype: torch.dtype,
+) -> PageBufferShapeDesc:
+    """Build a typed ``PageBufferShapeDesc`` for bench test groups."""
+    shape_desc = PageBufferShapeDesc()
+    shape_desc.kv_size = kv_size
+    shape_desc.nl = nl
+    shape_desc.nb = nb
+    shape_desc.bs = bs
+    shape_desc.nh = nh
+    shape_desc.hs = hs
+    shape_desc.element_size = dtype.itemsize
+    shape_desc.dtype = dtype
+    return shape_desc
+
+
+# ------------------------------------------------------------------ #
+#  Fixtures
+# ------------------------------------------------------------------ #
+
+
+@pytest.fixture
+def cmd() -> BenchCommand:
+    return BenchCommand()
+
+
+@pytest.fixture
+def parser(cmd: BenchCommand) -> argparse.ArgumentParser:
+    """Parser with ``bench server`` subcommand registered."""
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="command")
+    cmd.register(sub)
+    return p
+
+
+# ------------------------------------------------------------------ #
+#  Command metadata
+# ------------------------------------------------------------------ #
+
+
+class TestCommandMetadata:
+    def test_name(self, cmd: BenchCommand) -> None:
+        assert cmd.name() == "bench"
+
+    def test_help(self, cmd: BenchCommand) -> None:
+        assert "benchmark" in cmd.help().lower()
+
+    def test_server_helpers_live_under_server_bench_package(self) -> None:
+        """Helpers backing ``bench server`` must live inside the
+        ``server_bench`` sub-package, mirroring the engine / l2 layout.
+        """
+        # First Party
+        from lmcache.cli.commands.bench.server_bench import command as sv_cmd
+        from lmcache.cli.commands.bench.server_bench import helpers as sv_helpers
+
+        assert sv_cmd.__name__ == ("lmcache.cli.commands.bench.server_bench.command")
+        assert sv_helpers.__name__ == (
+            "lmcache.cli.commands.bench.server_bench.helpers"
+        )
+        assert callable(sv_cmd.add_server_arguments)
+        assert callable(sv_cmd.run_server_bench)
+
+
+class TestCaseDelegation:
+    def test_runs_one_case_with_one_client(
+        self,
+        cmd: BenchCommand,
+        parser: argparse.ArgumentParser,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Standard
+        from unittest.mock import ANY, MagicMock, call
+
+        # First Party
+        from lmcache.cli.commands.bench.server_bench import command as sv_cmd
+        from lmcache.cli.commands.bench.server_bench.cases.base import (
+            BenchResult,
+        )
+
+        client = MagicMock()
+        bench_case = MagicMock()
+        bench_case.name = "baseline"
+        case_result = BenchResult(
+            case_name="baseline",
+            completed_runs=2,
+            checks={
+                "checksum_match": [True, False],
+                "cold.server_checksum_match": [True, False],
+                "warm.server_checksum_match": [True, True],
+            },
+        )
+        bench_case.run.return_value = case_result
+        client_factory = MagicMock(return_value=client)
+        case_factory = MagicMock(return_value=bench_case)
+        metrics = MagicMock()
+        config_section = MagicMock()
+        result_section = MagicMock()
+        metrics.add_section.side_effect = [config_section, result_section]
+        create_metrics = MagicMock(return_value=metrics)
+        monkeypatch.setattr(sv_cmd, "ServerBenchClient", client_factory)
+        monkeypatch.setattr(sv_cmd, "BaselineBenchCase", case_factory)
+        monkeypatch.setattr(cmd, "create_metrics", create_metrics)
+        args = parser.parse_args(
+            [
+                "bench",
+                "server",
+                "--mode",
+                "cpu",
+                "--start",
+                "5",
+                "--end",
+                "7",
+                "--interval",
+                "0",
+                "--quiet",
+            ]
+        )
+
+        sv_cmd.run_server_bench(cmd, args)
+
+        case_factory.assert_called_once_with(
+            sequence_count=2,
+            sequence_id_offset=5,
+            sequence_id_stride=1,
+            interval_seconds=0.0,
+            num_tokens=512,
+            stop=ANY,
+        )
+        client_factory.assert_called_once_with(ANY, ANY, client_index=0)
+        client.start.assert_called_once_with()
+        bench_case.run.assert_called_once()
+        assert bench_case.run.call_args.args[0] is client
+        client.close.assert_called_once_with()
+        create_metrics.assert_called_once_with("Server Bench Result", args, width=64)
+        result_section.add.assert_has_calls(
+            [
+                call("total_requests", "Total requests", 2),
+                call("checksum_ok", "Checksum OK", 1),
+                call("checksum_fail", "Checksum FAIL", 1),
+                call("server_checksum_ok", "Server checksum OK", 3),
+                call("server_checksum_fail", "Server checksum FAIL", 1),
+                call("pass_rate", "Checksum pass rate (%)", 50.0),
+            ]
+        )
+        metrics.emit.assert_called_once_with()
+
+    def test_deals_sequences_across_concurrent_clients(
+        self,
+        cmd: BenchCommand,
+        parser: argparse.ArgumentParser,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Standard
+        from unittest.mock import ANY, MagicMock, call
+
+        # First Party
+        from lmcache.cli.commands.bench.server_bench import command as sv_cmd
+        from lmcache.cli.commands.bench.server_bench.cases.base import (
+            BenchResult,
+        )
+
+        clients = [MagicMock(), MagicMock()]
+        client_factory = MagicMock(side_effect=clients)
+        cases = [MagicMock(), MagicMock()]
+        for index, bench_case in enumerate(cases):
+            bench_case.name = "baseline"
+            bench_case.run.return_value = BenchResult(
+                case_name="baseline",
+                completed_runs=3 - index,
+                checks={"checksum_match": [True] * (3 - index)},
+            )
+        case_factory = MagicMock(side_effect=cases)
+        metrics = MagicMock()
+        result_section = MagicMock()
+        metrics.add_section.side_effect = [MagicMock(), result_section]
+        monkeypatch.setattr(sv_cmd, "ServerBenchClient", client_factory)
+        monkeypatch.setattr(sv_cmd, "BaselineBenchCase", case_factory)
+        monkeypatch.setattr(cmd, "create_metrics", MagicMock(return_value=metrics))
+        args = parser.parse_args(
+            [
+                "bench",
+                "server",
+                "--mode",
+                "cpu",
+                "--start",
+                "10",
+                "--end",
+                "15",
+                "--interval",
+                "0",
+                "--concurrency",
+                "2",
+                "--quiet",
+            ]
+        )
+
+        sv_cmd.run_server_bench(cmd, args)
+
+        assert case_factory.call_args_list == [
+            call(
+                sequence_count=3,
+                sequence_id_offset=10,
+                sequence_id_stride=2,
+                interval_seconds=0.0,
+                num_tokens=512,
+                stop=ANY,
+            ),
+            call(
+                sequence_count=2,
+                sequence_id_offset=11,
+                sequence_id_stride=2,
+                interval_seconds=0.0,
+                num_tokens=512,
+                stop=ANY,
+            ),
+        ]
+        assert client_factory.call_args_list == [
+            call(ANY, ANY, client_index=0),
+            call(ANY, ANY, client_index=1),
+        ]
+        for client, bench_case in zip(clients, cases, strict=True):
+            client.start.assert_called_once_with()
+            assert bench_case.run.call_args.args[0] is client
+            client.close.assert_called_once_with()
+        result_section.add.assert_any_call("total_requests", "Total requests", 5)
+        result_section.add.assert_any_call("checksum_ok", "Checksum OK", 5)
+        assert "requests_per_s" in [
+            add_call.args[0] for add_call in result_section.add.call_args_list
+        ]
+
+    def test_closes_client_when_case_fails(
+        self,
+        cmd: BenchCommand,
+        parser: argparse.ArgumentParser,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Standard
+        from unittest.mock import MagicMock
+
+        # First Party
+        from lmcache.cli.commands.bench.server_bench import command as sv_cmd
+
+        client = MagicMock()
+        bench_case = MagicMock()
+        bench_case.name = "baseline"
+        bench_case.run.side_effect = RuntimeError("case failed")
+        monkeypatch.setattr(sv_cmd, "ServerBenchClient", MagicMock(return_value=client))
+        monkeypatch.setattr(
+            sv_cmd,
+            "BaselineBenchCase",
+            MagicMock(return_value=bench_case),
+        )
+        args = parser.parse_args(
+            [
+                "bench",
+                "server",
+                "--mode",
+                "cpu",
+                "--start",
+                "0",
+                "--end",
+                "1",
+                "--interval",
+                "0",
+                "--quiet",
+            ]
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            sv_cmd.run_server_bench(cmd, args)
+
+        assert exc_info.value.code == 1
+        client.close.assert_called_once_with()
+
+
+# ------------------------------------------------------------------ #
+#  Argument registration
+# ------------------------------------------------------------------ #
+
+
+class TestCommandArguments:
+    def test_help_lists_supported_kv_dtypes(
+        self,
+        parser: argparse.ArgumentParser,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The help lists the dtypes supported by the shape parser."""
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["bench", "server", "--help"])
+        assert exc.value.code == 0
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert "supported: " + ", ".join(DTYPE_MAP) in help_text
+
+    def test_registers_subcommand(
+        self,
+        parser: argparse.ArgumentParser,
+    ) -> None:
+        args = parser.parse_args(["bench", "server"])
+        assert hasattr(args, "func")
+        assert args.bench_target == "server"
+
+    def test_default_values(
+        self,
+        parser: argparse.ArgumentParser,
+    ) -> None:
+        args = parser.parse_args(["bench", "server"])
+        assert args.rpc_url == "tcp://localhost:5555"
+        assert args.mode == "gpu"
+        assert args.num_tokens == 512
+        assert args.num_blocks == 1024
+        assert args.block_size == 16
+        assert args.start == 0
+        assert args.end is None
+        assert args.interval == 0.5
+        assert args.url == "http://localhost:8080"
+        assert args.tp_size == 1
+
+    def test_custom_values(
+        self,
+        parser: argparse.ArgumentParser,
+    ) -> None:
+        args = parser.parse_args(
+            [
+                "bench",
+                "server",
+                "--rpc-url",
+                "tcp://host:9999",
+                "--num-tokens",
+                "256",
+                "--num-blocks",
+                "512",
+                "--block-size",
+                "8",
+                "--start",
+                "5",
+                "--end",
+                "10",
+                "--interval",
+                "1.0",
+                "--url",
+                "http://other:9090",
+            ],
+        )
+        assert args.rpc_url == "tcp://host:9999"
+        assert args.num_tokens == 256
+        assert args.num_blocks == 512
+        assert args.block_size == 8
+        assert args.start == 5
+        assert args.end == 10
+        assert args.interval == 1.0
+        assert args.url == "http://other:9090"
+
+    def test_kvcache_shape_spec_default(
+        self,
+        parser: argparse.ArgumentParser,
+    ) -> None:
+        args = parser.parse_args(["bench", "server"])
+        assert "float16" in args.kvcache_shape_spec
+
+    def test_kvcache_shape_spec_custom(
+        self,
+        parser: argparse.ArgumentParser,
+    ) -> None:
+        args = parser.parse_args(
+            [
+                "bench",
+                "server",
+                "--kvcache-shape-spec",
+                "(2,512,8,4,64):bfloat16:16",
+            ],
+        )
+        assert args.kvcache_shape_spec == ("(2,512,8,4,64):bfloat16:16")
+
+
+# ------------------------------------------------------------------ #
+#  _build_token_ids
+# ------------------------------------------------------------------ #
+
+
+class TestBuildTokenIds:
+    def test_basic(self):
+        ids = _build_token_ids(seq_no=7, num_tokens=3)
+        assert ids[0] == 7
+        assert len(ids) == 4  # seq_no + 3 hello tokens
+        # All remaining tokens should be the hello token
+        assert all(t == 9906 for t in ids[1:])
+
+    def test_zero_tokens(self):
+        ids = _build_token_ids(seq_no=0, num_tokens=0)
+        assert ids == (0,)
+
+    def test_different_seq_no(self):
+        ids1 = _build_token_ids(seq_no=1, num_tokens=2)
+        ids2 = _build_token_ids(seq_no=2, num_tokens=2)
+        assert ids1[0] != ids2[0]
+        assert ids1[1:] == ids2[1:]
+
+
+# ------------------------------------------------------------------ #
+#  _make_key
+# ------------------------------------------------------------------ #
+
+
+class TestMakeKey:
+    def test_basic_key(self):
+        token_ids = (0, 9906, 9906)
+        key = _make_key(
+            token_ids,
+            request_id="req-0-cold",
+        )
+        assert key.model_name == "test-model"
+        assert key.world_size == 1
+        assert key.worker_id is None
+        assert unpack_token_ids(key.token_bytes) == list(token_ids)
+        assert key.start == 0
+        assert key.end == len(token_ids)
+        assert key.request_id == "req-0-cold"
+
+    def test_custom_start_end(self):
+        token_ids = (0, 9906, 9906, 9906, 9906)
+        key = _make_key(
+            token_ids,
+            request_id="req-1-warm",
+            start=2,
+            end=4,
+        )
+        assert key.start == 2
+        assert key.end == 4
+
+    def test_worker_id(self):
+        token_ids = (0, 9906)
+        key = _make_key(
+            token_ids,
+            request_id="req-0-cold",
+            worker_id=0,
+        )
+        assert key.worker_id == 0
+
+
+# ------------------------------------------------------------------ #
+#  _query_checksum
+# ------------------------------------------------------------------ #
+
+
+class _ChecksumHandler(BaseHTTPRequestHandler):
+    """Tiny HTTP handler that records the POST body and returns fake checksums.
+
+    Mirrors the MP server's ``POST /cache/checksums`` (the old ``GET
+    /kvcache/check`` was removed). The received JSON is stored on the server so
+    the test can assert the request shape ``_query_checksum`` sends.
+    """
+
+    def do_POST(self):
+        if "/cache/checksums" not in self.path:
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(length).decode())
+        self.server.received_payloads.append(payload)
+        body = json.dumps(
+            {
+                "status": "success",
+                "chunk_checksums": {"layer_0": ["a" * 32, "b" * 32]},
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass  # suppress logs
+
+
+class TestQueryChecksum:
+    @pytest.fixture(autouse=True)
+    def _start_server(self):
+        """Start a tiny HTTP server for the test."""
+        self.server = HTTPServer(
+            ("127.0.0.1", 0),
+            _ChecksumHandler,
+        )
+        self.server.received_payloads = []
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+        )
+        self.thread.daemon = True
+        self.thread.start()
+        yield
+        self.server.shutdown()
+
+    def test_success(self):
+        base = "http://127.0.0.1:%d" % self.port
+        result = _query_checksum(
+            base,
+            block_ids=[3, 1],
+            blocks_per_chunk=1,
+            instance_id=1000,
+        )
+        assert result is not None
+        assert result == {"layer_0": ["a" * 32, "b" * 32]}
+        # The POST body matches the MP /cache/checksums contract: block-native
+        # ids in logical order and a block-level chunk_size.
+        assert len(self.server.received_payloads) == 1
+        sent = self.server.received_payloads[0]
+        assert sent["block_ids"] == [3, 1]
+        assert sent["chunk_size"] == 1
+        assert sent["layerwise"] is True
+        assert sent["instance_id"] == 1000
+
+    def test_unreachable_returns_none(self):
+        result = _query_checksum(
+            "http://127.0.0.1:1",
+            block_ids=[3, 1],
+            blocks_per_chunk=1,
+            instance_id=1000,
+        )
+        assert result is None
+
+
+# ------------------------------------------------------------------ #
+#  ROUTER endpoint fixture                                             #
+# ------------------------------------------------------------------ #
+
+
+@pytest.fixture
+def router_endpoint() -> str:
+    """Request an ephemeral TCP port when the ROUTER binds."""
+    return "tcp://127.0.0.1:0"
+
+
+# ------------------------------------------------------------------ #
+#  KVCacheBuffers allocation (dtype branching)
+# ------------------------------------------------------------------ #
+
+
+class TestAllocateKVCache:
+    """Regression tests for ``KVCacheBuffers`` dtype handling.
+
+    ``torch.randn`` only supports floating-point dtypes, so integer
+    dtypes in ``DTYPE_MAP`` (e.g. ``uint8`` used by FP8 quantized
+    layouts) must fall back to ``torch.randint`` -- see Bugbot
+    #3147565172.
+    """
+
+    @staticmethod
+    def _alloc(dtype: torch.dtype) -> list[torch.Tensor]:
+        dtype_name = str(dtype).removeprefix("torch.")
+        buffers = KVCacheBuffers(
+            parse_kvcache_shape_spec(f"(2,2,2,2,4):{dtype_name}:1"), device="cpu"
+        )
+        return list(buffers.kv_caches.values())
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float16, torch.float32, torch.bfloat16],
+    )
+    def test_floating_point_dtype(self, dtype: torch.dtype) -> None:
+        tensors = self._alloc(dtype)
+        assert len(tensors) == 1
+        assert tensors[0].dtype == dtype
+        assert tensors[0].shape == (2, 2, 2, 2, 4)
+
+    def test_uint8_dtype_uses_randint(self) -> None:
+        """Regression: ``torch.randn`` crashes with integer dtypes."""
+        tensors = self._alloc(torch.uint8)
+        assert len(tensors) == 1
+        assert tensors[0].dtype == torch.uint8
+        assert tensors[0].shape == (2, 2, 2, 2, 4)
+
+    def test_groups_honour_per_group_shape_and_dtype(self) -> None:
+        """Multi-group spec must allocate per-layer shape / dtype.
+
+        Regression for Bugbot #3150738055: previously every layer was
+        allocated with the *first* group's ``nh`` / ``hs`` / ``dtype``
+        (and the total ``num_layers`` from the sum), silently producing
+        wrong tensors for layers in later groups.
+        """
+        # First Party
+        from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+
+        # Group A: 3 layers of (2, 2, 2, 8, 16), float16
+        # Group B: 2 layers of (1, 2, 2, 4, 32), bfloat16
+        # (NB / BS are intentionally identical — that's a hard
+        # requirement of paged KV, enforced in CLI execute().)
+        group_a = KVLayerGroupInfo(
+            layer_indices=[0, 1, 2],
+            shape_desc=_make_shape_desc(
+                kv_size=2,
+                nl=3,
+                nb=2,
+                bs=2,
+                nh=8,
+                hs=16,
+                dtype=torch.float16,
+            ),
+            dtype=torch.float16,
+        )
+        group_b = KVLayerGroupInfo(
+            layer_indices=[3, 4],
+            shape_desc=_make_shape_desc(
+                kv_size=1,
+                nl=2,
+                nb=2,
+                bs=2,
+                nh=4,
+                hs=32,
+                dtype=torch.bfloat16,
+            ),
+            dtype=torch.bfloat16,
+        )
+        buffers = KVCacheBuffers([group_a, group_b], device="cpu")
+        tensors = list(buffers.kv_caches.values())
+        assert len(tensors) == 5
+        for t in tensors[:3]:
+            assert t.shape == (2, 2, 2, 8, 16)
+            assert t.dtype == torch.float16
+        for t in tensors[3:]:
+            # MLA groups (kv_size == 1) allocate rank-3 ``(NB, BS, NH*HS)``
+            # to match the vLLM ``NL_X_NB_BS_HS`` detector contract.
+            assert t.shape == (2, 2, 4 * 32)
+            assert t.dtype == torch.bfloat16
+
+
+# ------------------------------------------------------------------ #
+#  _send_lookup / _poll_prefetch_status (protocol regression)          #
+# ------------------------------------------------------------------ #
+
+
+class _LookupRouter:
+    """Fake ROUTER implementing the LOOKUP / QUERY_PREFETCH_STATUS
+    subset of the MP server protocol.
+
+    * ``LOOKUP`` replies with **no payload** (void response) — the
+      real server-side handler returns ``None``. Regression for a
+      bug where the client treated the empty frame list as a
+      timeout and printed ``LOOKUP timeout``.
+    * ``QUERY_PREFETCH_STATUS`` accepts a ``request_id`` (str) and
+      returns ``None`` on the first N polls, then a fixed chunk
+      count — exercising both the in-progress and done branches.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        in_progress_polls: int = 1,
+        hit_chunks: int = 3,
+    ) -> None:
+        self._endpoint = endpoint
+        self._in_progress_left = in_progress_polls
+        self._hit_chunks = hit_chunks
+        self.last_query_request_id: str | None = None
+        self._ctx = zmq.Context.instance()
+        self._router = self._ctx.socket(zmq.ROUTER)
+        self._router.bind(endpoint)
+        self.endpoint = self._router.getsockopt_string(zmq.LAST_ENDPOINT)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self._router.close(linger=0)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if not self._router.poll(100, zmq.POLLIN):
+                continue
+            frames = self._router.recv_multipart()
+            identity, uid_f, type_f, *payload = frames
+            operation = decode_operation(type_f)
+            if operation == "lookup":
+                # Void reply: no payload frame.
+                self._router.send_multipart([identity, uid_f, type_f])
+            elif operation == "query_prefetch_status":
+                req_id = msgspec.msgpack.decode(payload[0], type=str)
+                self.last_query_request_id = req_id
+                if self._in_progress_left > 0:
+                    self._in_progress_left -= 1
+                    body = msgspec.msgpack.encode(None)
+                else:
+                    body = msgspec.msgpack.encode(self._hit_chunks)
+                self._router.send_multipart([identity, uid_f, type_f, body])
+
+
+class TestLookupProtocol:
+    def _make_client(self, endpoint: str) -> RequestClient:
+        ctx = zmq.Context.instance()
+        return RequestClientFactory.create(endpoint, context=ctx)
+
+    def test_send_lookup_void_reply_is_success(
+        self,
+        router_endpoint: str,
+    ) -> None:
+        """LOOKUP handler returns None (void) — must not be timeout."""
+        router = _LookupRouter(router_endpoint)
+        router.start()
+        try:
+            client = self._make_client(router.endpoint)
+            key = _make_key((1, 9906, 9906), request_id="req-void")
+            assert _send_lookup(client, key) is True
+            client.close()
+        finally:
+            router.stop()
+
+    def test_poll_prefetch_status_uses_request_id(
+        self,
+        router_endpoint: str,
+    ) -> None:
+        """QUERY_PREFETCH_STATUS payload is keyed by request_id str."""
+        router = _LookupRouter(
+            router_endpoint,
+            in_progress_polls=2,
+            hit_chunks=5,
+        )
+        router.start()
+        try:
+            client = self._make_client(router.endpoint)
+            hit = _poll_prefetch_status(
+                client,
+                "req-42",
+                max_polls=10,
+                poll_interval=0.0,
+            )
+            assert hit == 5
+            assert router.last_query_request_id == "req-42"
+            client.close()
+        finally:
+            router.stop()
+
+
+# ------------------------------------------------------------------ #
+#  Allocation shape contract (MLA vs. classical)                       #
+# ------------------------------------------------------------------ #
+
+
+class TestAllocShapeContract:
+    """The bench's paged-tensor allocation must match the shapes the
+    server's vLLM detector recognises: rank-5 ``(kv, NB, BS, NH, HS)``
+    for classical K/V, rank-3 ``(NB, BS, hidden)`` for MLA. Getting
+    this wrong is what caused ``lmcache_driven + MLA`` to be rejected
+    with ``unsupported kv_caches structure`` at register time.
+    """
+
+    def test_mla_alloc_shape_is_rank3(self) -> None:
+        # First Party
+        from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+
+        group = KVLayerGroupInfo(
+            layer_indices=[0, 1],
+            shape_desc=_make_shape_desc(
+                kv_size=1,
+                nl=2,
+                nb=4,
+                bs=2,
+                nh=1,
+                hs=32,
+                dtype=torch.bfloat16,
+            ),
+            dtype=torch.bfloat16,
+        )
+        tensors = list(KVCacheBuffers([group], device="cpu").kv_caches.values())
+        assert len(tensors) == 2
+        for t in tensors:
+            assert t.dim() == 3
+            assert t.shape == (4, 2, 1 * 32)
+            assert t.dtype == torch.bfloat16
+
+    def test_classical_alloc_shape_is_rank5(self) -> None:
+        # First Party
+        from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+
+        group = KVLayerGroupInfo(
+            layer_indices=[0],
+            shape_desc=_make_shape_desc(
+                kv_size=2,
+                nl=1,
+                nb=4,
+                bs=2,
+                nh=8,
+                hs=16,
+                dtype=torch.float16,
+            ),
+            dtype=torch.float16,
+        )
+        tensors = list(KVCacheBuffers([group], device="cpu").kv_caches.values())
+        assert len(tensors) == 1
+        assert tensors[0].shape == (2, 4, 2, 8, 16)
+
+
+# ------------------------------------------------------------------ #
+#  Multi-worker (TP > 1) fan-out                                       #
+# ------------------------------------------------------------------ #
+
+
+class TestClientMultiWorker:
+    """Test scheduler LOOKUP and per-rank STORE/RETRIEVE fan-out."""
+
+    @pytest.mark.parametrize(
+        ("mode", "transfer_mode", "num_groups"),
+        [
+            ("cpu", "auto", 2),
+            ("cpu", "engine_driven", 2),
+            ("gpu", "engine_driven", 2),
+            ("cpu", "engine_driven", 1),
+            ("cpu", "lmcache_driven", 2),
+        ],
+    )
+    def test_start_validates_transfer_group_support(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mode: str,
+        transfer_mode: str,
+        num_groups: int,
+    ) -> None:
+        """Reject unsupported groups before registration, including async contexts."""
+        # First Party
+        from lmcache import torch_dev
+        from lmcache.cli.commands.bench.server_bench.client import ServerBenchClient
+        from lmcache.cli.commands.bench.server_bench.config import BenchConfig
+        from lmcache.v1.multiprocess import transfer_context as tc
+
+        register = MagicMock()
+        context_type = (
+            tc.AsyncEngineDrivenTransferContext
+            if mode == "gpu"
+            else tc.LMCacheDrivenTransferContext
+        )
+        context = MagicMock(spec=context_type, register=register)
+        monkeypatch.setattr(tc.EngineDrivenTransferContext, "register", register)
+        monkeypatch.setattr(
+            client_module, "create_transfer_context", lambda *a, **kw: context
+        )
+        monkeypatch.setattr(torch_dev, "is_available", lambda: True)
+        monkeypatch.setattr(zmq, "Context", MagicMock)
+        monkeypatch.setattr(RequestClientFactory, "create", MagicMock())
+        monkeypatch.setattr(client_module, "_get_chunk_size", lambda client: 2)
+        monkeypatch.setattr(
+            client_module,
+            "KVCacheBuffers",
+            lambda **kw: KVCacheBuffers(kw["groups"], device="cpu"),
+        )
+        bench = ServerBenchClient(
+            BenchConfig(
+                rpc_url="ipc:///tmp/test-bench-group-support",
+                http_url="",
+                mode=mode,
+                transfer_mode=transfer_mode,
+                tp_size=1,
+                use_mla=False,
+                num_tokens=3,
+                kvcache_shape_spec=";".join(
+                    f"(2,16,2,{i + 1},4):float16:1" for i in range(num_groups)
+                ),
+                num_blocks=16,
+                block_size=2,
+            ),
+            lambda message: None,
+        )
+        try:
+            if num_groups > 1 and transfer_mode != "lmcache_driven":
+                with pytest.raises(ValueError, match="one KV group.*lmcache_driven"):
+                    bench.start()
+                register.assert_not_called()
+                if mode == "gpu":
+                    context.close.assert_called_once_with()
+            else:
+                bench.start()
+                register.assert_called_once()
+        finally:
+            bench.close()
+
+    @pytest.mark.parametrize("transfer_mode", ["lmcache_driven", "engine_driven"])
+    def test_start_rolls_back_partial_registration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        transfer_mode: str,
+    ) -> None:
+        """Clean up acknowledged and timed-out registrations after startup fails."""
+        # Standard
+        from unittest.mock import call
+
+        # First Party
+        from lmcache.cli.commands.bench.server_bench.client import ServerBenchClient
+        from lmcache.cli.commands.bench.server_bench.config import BenchConfig
+        from lmcache.v1.multiprocess.transfer_context import worker_transfer
+
+        tensor_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+        def fake_allocate(
+            *,
+            groups: list[KVLayerGroupInfo],
+            device: str | torch.device | None,
+            block_size: int,
+        ) -> KVCacheBuffers:
+            buffers = KVCacheBuffers(groups, device="cpu", block_size=block_size)
+            tensor_refs.extend(weakref.ref(t) for t in buffers.kv_caches.values())
+            return buffers
+
+        ready: MessagingFuture[None] = MessagingFuture()
+        ready.set_result(None)
+        timed_out = MagicMock()
+        timed_out.result.side_effect = TimeoutError
+        transport = MagicMock()
+        register = (
+            transport.register_kv_cache
+            if transfer_mode == "lmcache_driven"
+            else transport.register_kv_cache_engine_driven_context
+        )
+        unregister = (
+            transport.unregister_kv_cache
+            if transfer_mode == "lmcache_driven"
+            else transport.unregister_kv_cache_engine_driven_context
+        )
+        register.side_effect = [ready, timed_out]
+        unregister.return_value = ready
+        context = MagicMock()
+        monkeypatch.setattr(zmq, "Context", lambda: context)
+        monkeypatch.setattr(RequestClientFactory, "create", lambda *a, **kw: transport)
+        monkeypatch.setattr(client_module, "_get_chunk_size", lambda client: 16)
+        monkeypatch.setattr(client_module, "KVCacheBuffers", fake_allocate)
+        monkeypatch.setattr(worker_transfer, "get_event_ipc_backend", MagicMock())
+        monkeypatch.setattr(worker_transfer, "wrap_kv_caches", lambda caches: [])
+        bench_client = ServerBenchClient(
+            BenchConfig(
+                rpc_url="ipc:///tmp/test-runtime-rollback",
+                http_url="",
+                mode="cpu",
+                transfer_mode=transfer_mode,
+                tp_size=2,
+                use_mla=False,
+                num_tokens=31,
+                kvcache_shape_spec="(2,64,16,1,4):float16:1",
+                num_blocks=64,
+                block_size=16,
+            ),
+            lambda message: None,
+        )
+
+        with pytest.raises(RuntimeError, match="rank 1"):
+            bench_client.start()
+        bench_client.close()  # Cleanup remains idempotent after failed startup.
+
+        assert unregister.call_args_list == [call(1000), call(1001)]
+        transport.close.assert_called_once_with()
+        context.term.assert_called_once_with()
+        gc.collect()
+        assert all(ref() is None for ref in tensor_refs)
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        is_mla: bool,
+        tp_size: int,
+        transfer_mode: str = "lmcache_driven",
+        client_index: int = 0,
+    ) -> tuple[
+        list[tuple[str, tuple[Any, ...]]],
+        list[tuple[str, tuple[Any, ...]]],
+        tuple[Any, ...],
+    ]:
+        """Run the public client operations against mocked transport."""
+        # Standard
+        from unittest.mock import MagicMock
+        import gc
+        import weakref
+
+        # First Party
+        from lmcache.cli.commands.bench.server_bench.client import (
+            ServerBenchClient,
+        )
+        from lmcache.cli.commands.bench.server_bench.config import BenchConfig
+
+        request_calls: list[tuple[str, tuple[Any, ...]]] = []
+        transfer_calls: list[tuple[str, tuple[Any, ...]]] = []
+        tensor_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+        lifetimes: list[tuple[str, bool]] = []
+
+        class FakeContext:
+            def setsockopt(self, option: int, value: int) -> None:
+                """Accept socket defaults without creating a real socket."""
+                pass
+
+            def term(self) -> None:
+                pass
+
+        class FakeClient:
+            def lookup(self, *payloads: Any) -> SimpleNamespace:
+                request_calls.append(("lookup", payloads))
+                return SimpleNamespace(result=lambda timeout=None: None)
+
+            def query_prefetch_status(self, *payloads: Any) -> SimpleNamespace:
+                request_calls.append(("query_prefetch_status", payloads))
+                return SimpleNamespace(result=lambda timeout=None: 0)
+
+            def end_session(self, *payloads: Any) -> SimpleNamespace:
+                request_calls.append(("end_session", payloads))
+                return SimpleNamespace(result=lambda timeout=None: None)
+
+            def unregister_kv_cache(self, *payloads: Any) -> SimpleNamespace:
+                request_calls.append(("unregister_kv_cache", payloads))
+                return SimpleNamespace(result=lambda timeout=None: None)
+
+            def unregister_kv_cache_engine_driven_context(
+                self, *payloads: Any
+            ) -> SimpleNamespace:
+                request_calls.append(
+                    ("unregister_kv_cache_engine_driven_context", payloads)
+                )
+                return SimpleNamespace(result=lambda timeout=None: None)
+
+            def close(self) -> None:
+                pass
+
+        class FakeFuture:
+            def result(self, timeout: float | None = None) -> bool:
+                return True
+
+            def retain_reference(self, _reference: object) -> None:
+                pass
+
+        class FakeTransferContext:
+            def __init__(self, instance_id: int, req_client: FakeClient) -> None:
+                self.instance_id = instance_id
+                self.req_client = req_client
+
+            def register(self, *_args: Any, **_kwargs: Any) -> None:
+                transfer_calls.append(("register", (self.instance_id,)))
+
+            def unregister(self) -> SimpleNamespace:
+                lifetimes.append(
+                    ("unregister", all(ref() is not None for ref in tensor_refs))
+                )
+                return self.req_client.unregister_kv_cache(self.instance_id)
+
+            def create_recorded_event(self) -> None:
+                return None
+
+            def submit_store(self, *payloads: Any, **_kwargs: Any) -> FakeFuture:
+                transfer_calls.append(("store", payloads))
+                return FakeFuture()
+
+            def submit_retrieve(self, *payloads: Any, **_kwargs: Any) -> FakeFuture:
+                transfer_calls.append(("retrieve", payloads))
+                return FakeFuture()
+
+            def flush_inflight_stores(self) -> None:
+                lifetimes.append(
+                    ("flush", all(ref() is not None for ref in tensor_refs))
+                )
+
+            def close(self) -> None:
+                lifetimes.append(
+                    ("close", all(ref() is not None for ref in tensor_refs))
+                )
+
+        class FakeEngineDrivenTransferContext(FakeTransferContext):
+            def __init__(self, instance_id: int, req_client: FakeClient) -> None:
+                super().__init__(instance_id, req_client)
+                transfer_calls.append(("sync_context", ()))
+
+            def unregister(self) -> SimpleNamespace:
+                lifetimes.append(
+                    ("unregister", all(ref() is not None for ref in tensor_refs))
+                )
+                return self.req_client.unregister_kv_cache_engine_driven_context(
+                    self.instance_id
+                )
+
+        def fake_allocate(
+            *,
+            groups: list[KVLayerGroupInfo],
+            device: str | torch.device | None,
+            block_size: int,
+        ) -> KVCacheBuffers:
+            buffers = KVCacheBuffers(groups, device="cpu", block_size=block_size)
+            tensor_refs.extend(weakref.ref(t) for t in buffers.kv_caches.values())
+            return buffers
+
+        def fake_create_transfer_context(
+            kv_caches: dict[str, torch.Tensor],
+            *,
+            instance_id: int,
+            req_client: FakeClient,
+            mode: str,
+        ) -> FakeTransferContext:
+            transfer_calls.append(("factory", (kv_caches, mode)))
+            return FakeTransferContext(instance_id, req_client)
+
+        monkeypatch.setattr(client_module, "KVCacheBuffers", fake_allocate)
+        monkeypatch.setattr(zmq, "Context", FakeContext)
+        monkeypatch.setattr(
+            RequestClientFactory,
+            "create",
+            lambda *_args, **_kwargs: FakeClient(),
+        )
+        monkeypatch.setattr(client_module, "_get_chunk_size", lambda _client: 16)
+        monkeypatch.setattr(
+            client_module,
+            "create_transfer_context",
+            fake_create_transfer_context,
+        )
+        monkeypatch.setattr(
+            client_module,
+            "EngineDrivenTransferContext",
+            FakeEngineDrivenTransferContext,
+        )
+
+        kv_size = 1 if is_mla else 2
+        bench_client = ServerBenchClient(
+            BenchConfig(
+                rpc_url="ipc:///tmp/test-runtime",
+                http_url="",
+                mode="cpu",
+                transfer_mode=transfer_mode,
+                tp_size=tp_size,
+                use_mla=is_mla,
+                num_tokens=31,
+                kvcache_shape_spec=("(%d,64,16,1,1):float16:1" % kv_size),
+                num_blocks=64,
+                block_size=16,
+            ),
+            MagicMock(),
+            client_index=client_index,
+        )
+        bench_client.start()
+        gc.collect()
+        assert all(ref() is not None for ref in tensor_refs)
+        try:
+            request = bench_client.create_request(
+                0, "req-0-test", "test", token_ids=tuple(range(32))
+            )
+            assert request is not None
+            lookup = bench_client.lookup(request)
+            store = bench_client.store(
+                request,
+                start_token=0,
+                token_count=request.num_full_tokens,
+            )
+            retrieve = bench_client.retrieve(
+                request,
+                start_token=0,
+                token_count=request.num_full_tokens,
+            )
+            bench_client.release_request(request)
+            result = (lookup, store, retrieve)
+        finally:
+            bench_client.close()
+        gc.collect()
+        assert all(ref() is None for ref in tensor_refs)
+        assert (
+            lifetimes
+            == [("flush", True), ("unregister", True)] * tp_size
+            + [("close", True)] * tp_size
+        )
+
+        return request_calls, transfer_calls, result
+
+    @pytest.mark.parametrize("transfer_mode", ["auto", "engine_driven"])
+    def test_cpu_engine_driven_modes_use_sync_context_directly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        transfer_mode: str,
+    ) -> None:
+        _request_calls, transfer_calls, _result = self._run(
+            monkeypatch,
+            is_mla=False,
+            tp_size=1,
+            transfer_mode=transfer_mode,
+        )
+
+        assert [call for call in transfer_calls if call[0] == "sync_context"] == [
+            ("sync_context", ())
+        ]
+        assert not [call for call in transfer_calls if call[0] == "factory"]
+
+    def test_mla_tp2_store_only_from_rank0(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _request_calls, transfer_calls, result = self._run(
+            monkeypatch, is_mla=True, tp_size=2
+        )
+        lookup, store_result, retrieve_result = result
+        stores = [call for call in transfer_calls if call[0] == "store"]
+        retrieves = [call for call in transfer_calls if call[0] == "retrieve"]
+        factories = [call for call in transfer_calls if call[0] == "factory"]
+        # MLA: rank 0 only.
+        assert len(stores) == 1, "MLA tp=2 should STORE once (rank 0)"
+        # Worker identity is bound at context construction, not per transfer.
+        store_key = stores[0][1][1]
+        assert [call[1][0] for call in transfer_calls if call[0] == "register"] == [
+            1000,
+            1001,
+        ]
+        # MLA folds all TP ranks into kv_worker_id 0 with kv_world_size 1
+        # -- must match ParallelStrategy.kv_worker_id / .kv_world_size
+        # or LOOKUP expands to kv_ranks the STORE never wrote and every
+        # warm pass misses.
+        assert store_key.world_size == 1, (
+            "MLA STORE key.world_size must be 1 (kv_world_size), got %d"
+            % store_key.world_size
+        )
+        assert store_key.worker_id == 0, (
+            "MLA STORE key.worker_id must be 0 (kv_worker_id), got %s"
+            % store_key.worker_id
+        )
+        assert lookup.is_full_miss
+        assert store_result is not None
+        assert store_result.attempted_worker_ranks == (0,)
+        assert store_result.successful_worker_ranks == (0,)
+        assert store_result.succeeded
+        assert len(retrieves) == 2
+        assert retrieve_result is not None
+        assert retrieve_result.attempted_worker_ranks == (0, 1)
+        assert retrieve_result.succeeded
+        assert [call[1][1] for call in factories] == [
+            "lmcache_driven",
+            "lmcache_driven",
+        ]
+
+    def test_non_mla_tp2_store_on_every_rank(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _request_calls, transfer_calls, result = self._run(
+            monkeypatch, is_mla=False, tp_size=2
+        )
+        _lookup, store_result, retrieve_result = result
+        stores = [call for call in transfer_calls if call[0] == "store"]
+        retrieves = [call for call in transfer_calls if call[0] == "retrieve"]
+        # Non-MLA: every rank stores.
+        assert len(stores) == 2
+        instance_ids = sorted(
+            call[1][0] for call in transfer_calls if call[0] == "register"
+        )
+        assert instance_ids == [1000, 1001]
+        # Non-MLA: each rank stores under its own kv_worker_id, with
+        # kv_world_size == tp_size.
+        for call in stores:
+            store_key = call[1][1]
+            assert store_key.world_size == 2, (
+                "non-MLA STORE key.world_size must be tp_size=2, got %d"
+                % store_key.world_size
+            )
+        worker_ids = sorted(call[1][1].worker_id for call in stores)
+        assert worker_ids == [0, 1]
+        assert store_result is not None
+        assert store_result.attempted_worker_ranks == (0, 1)
+        assert store_result.successful_worker_ranks == (0, 1)
+        assert store_result.succeeded
+        assert len(retrieves) == 2
+        assert retrieve_result is not None
+        assert retrieve_result.attempted_worker_ranks == (0, 1)
+        assert retrieve_result.succeeded
+
+    def test_second_client_registers_past_first_clients_instance_ids(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _request_calls, transfer_calls, _result = self._run(
+            monkeypatch, is_mla=False, tp_size=2, client_index=1
+        )
+        instance_ids = sorted(
+            call[1][0] for call in transfer_calls if call[0] == "register"
+        )
+        assert instance_ids == [1002, 1003]
+
+    @pytest.mark.parametrize("is_mla", [True, False])
+    @pytest.mark.parametrize("tp", [1, 2, 4])
+    def test_lookup_called_once_regardless_of_tp(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        is_mla: bool,
+        tp: int,
+    ) -> None:
+        request_calls, _transfer_calls, _result = self._run(
+            monkeypatch, is_mla=is_mla, tp_size=tp
+        )
+        lookups = [call for call in request_calls if call[0] == "lookup"]
+        assert len(lookups) == 1, (
+            "LOOKUP should fire exactly once regardless of tp_size "
+            "(is_mla=%s, tp=%d)" % (is_mla, tp)
+        )
+        assert lookups[0][1][0].num_kv_readers == (tp if is_mla else 1)
+        # Reader count comes from the key; tp_size is a legacy wire field.
+        assert lookups[0][1][1] == tp, (
+            "LOOKUP payload tp_size must equal simulated tp "
+            "(is_mla=%s, tp=%d, got=%s)" % (is_mla, tp, lookups[0][1][1])
+        )
+
+
+class _ExportedEvent:
+    pass
+
+
+@pytest.mark.parametrize("operation", ["store", "retrieve"])
+@pytest.mark.parametrize("times_out", [False, True])
+def test_handle_mode_preserves_event_lifetime_through_transfer_context(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    times_out: bool,
+) -> None:
+    """Keep producer events on the transport future across caller timeouts.
+
+    Exercise the public bench API with the real LMCache-driven context and
+    device future, replacing only transport and platform event operations.
+    """
+    # First Party
+    from lmcache.cli.commands.bench.server_bench.client import ServerBenchClient
+    from lmcache.cli.commands.bench.server_bench.config import BenchConfig
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+
+    event_ref: weakref.ReferenceType[_ExportedEvent] | None = None
+    backend_calls: list[str] = []
+
+    def create_event(device: torch.device) -> _ExportedEvent:
+        nonlocal event_ref
+        assert device.type == "cpu"
+        event = _ExportedEvent()
+        event_ref = weakref.ref(event)
+        backend_calls.append("create")
+        return event
+
+    def record_event(event: object, stream: object) -> None:
+        assert event_ref is not None and event_ref() is event
+        backend_calls.append("record")
+
+    def export_event(event: object, device: torch.device) -> bytes:
+        assert event_ref is not None and event_ref() is event
+        backend_calls.append("export")
+        return b"producer-handle"
+
+    def synchronize_event(event: object, device: torch.device) -> None:
+        assert event_ref is not None and event_ref() is not None
+        backend_calls.append("synchronize")
+
+    backend = SimpleNamespace(
+        check_event_support=lambda device: None,
+        create_event=create_event,
+        record_event=record_event,
+        export_event=export_event,
+        import_event=lambda handle, device: handle,
+        synchronize_event=synchronize_event,
+    )
+
+    class ObservedFuture(MessagingFuture[tuple[bytes, bool]]):
+        def wait(self, timeout: float | None = None) -> bool:
+            assert event_ref is not None and event_ref() is not None
+            backend_calls.append("wait")
+            return super().wait(timeout=0)
+
+    raw_future = ObservedFuture()
+    if not times_out:
+        raw_future.set_result((b"completion-handle", True))
+    ready: MessagingFuture[None] = MessagingFuture()
+    ready.set_result(None)
+    transport = MagicMock()
+    transport.register_kv_cache.return_value = ready
+    transport.unregister_kv_cache.return_value = ready
+    transport.store.return_value = raw_future
+    transport.retrieve.return_value = raw_future
+    monkeypatch.setattr(zmq, "Context", MagicMock)
+    monkeypatch.setattr(RequestClientFactory, "create", lambda *a, **kw: transport)
+    monkeypatch.setattr(client_module, "_get_chunk_size", lambda client: 2)
+    monkeypatch.setattr(
+        worker_transfer, "get_event_ipc_backend", lambda device: backend
+    )
+    monkeypatch.setattr(
+        worker_transfer, "wrap_kv_caches", lambda caches: list(caches.values())
+    )
+    monkeypatch.setattr(worker_transfer.torch_dev, "current_stream", lambda: None)
+    bench = ServerBenchClient(
+        BenchConfig(
+            rpc_url="ipc:///tmp/test-bench-event-lifetime",
+            http_url="",
+            mode="cpu",
+            transfer_mode="lmcache_driven",
+            tp_size=1,
+            use_mla=False,
+            num_tokens=3,
+            kvcache_shape_spec="(2,8,2,1,4):float16:1",
+            num_blocks=8,
+            block_size=2,
+        ),
+        lambda message: None,
+    )
+    bench.start()
+    try:
+        request = bench.create_request(
+            0, "req-event", "test", token_ids=tuple(range(4))
+        )
+        assert request is not None
+        result = getattr(bench, operation)(request, start_token=0, token_count=4)
+        assert result is not None
+        assert result.successful_worker_ranks == (() if times_out else (0,))
+        assert result.failed_worker_ranks == ((0,) if times_out else ())
+        call = getattr(transport, operation)
+        call.assert_called_once()
+        assert call.call_args.args[1:4] == (1000, [[0, 1]], b"producer-handle")
+        assert backend_calls[:3] == ["create", "record", "export"]
+        assert "wait" in backend_calls
+        assert ("synchronize" in backend_calls) is not times_out
+        assert event_ref is not None
+        gc.collect()
+        if times_out:
+            # The device wrapper has gone out of scope; only transport remains.
+            assert event_ref() is not None
+            raw_future.set_result((b"", True))
+            raw_future.release_references()
+            gc.collect()
+        assert event_ref() is None
+    finally:
+        bench.close()

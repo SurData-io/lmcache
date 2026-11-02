@@ -1,0 +1,437 @@
+# Per-Request Root Span
+
+This document describes the root span design for `MPServerTracingSubscriber`:
+how a single `"request"` OTel span wraps all child operations for one request,
+and how the span close is deferred correctly when GPU stores are still in flight.
+
+## Problem
+
+Before this change, `MPServerTracingSubscriber` emitted flat, orphaned child
+spans (`mp.store`, `mp.retrieve`, `mp.lookup_prefetch`) with no parent context.
+Traces in Tempo/Jaeger showed disconnected spans with no request-level view.
+
+## Design
+
+Each request gets one root `"request"` span that:
+
+- Opens at `MP_REQUEST_START` — the first CPU-synchronous touch of a `request_id`
+- Nests all child spans beneath it via OTel context propagation
+- Closes at `MP_REQUEST_END`, deferred if async GPU stores are still in flight
+
+### New Events
+
+Four new `EventType` values, all CPU-synchronous:
+
+| Event | Published from | Purpose |
+|-------|---------------|---------|
+| `MP_REQUEST_START` | `lookup_prefetch_start()`, top of method | Open root span at true request arrival |
+| `MP_STORE_SUBMITTED` | `store()`, before `publish_on_stream(MP_STORE_START)` | Register a pending GPU store before it's enqueued |
+| `MP_RETRIEVE_SUBMITTED` | `retrieve()`, before `publish_on_stream(MP_RETRIEVE_START)` | Register a pending GPU retrieve before it's enqueued |
+| `MP_REQUEST_END` | `end_session()`, after `session_manager.remove()` | Signal that the session lifecycle is complete |
+
+### Deferral Protocol
+
+`end_session()` is CPU-synchronous; GPU store/retrieve callbacks (`MP_STORE_END`,
+`MP_RETRIEVE_END`) fire later via CUDA host callbacks. Without coordination,
+`MP_REQUEST_END` can arrive and close the root span before GPU work finishes —
+producing orphaned child spans.
+
+The fix: `MP_STORE_SUBMITTED` and `MP_RETRIEVE_SUBMITTED` are published *before*
+the respective GPU work is enqueued, incrementing `_pending_store_count` and
+`_pending_retrieve_count`. When `MP_REQUEST_END` arrives:
+
+- If both counters are zero → close root immediately
+- Otherwise → save the `REQUEST_END` timestamp; the last `MP_STORE_END` or
+  `MP_RETRIEVE_END` to decrement its counter to zero (when the other counter is
+  also zero) closes the root using that saved timestamp
+
+Root end-time is always the `REQUEST_END` timestamp (the logical request end),
+not the GPU callback timestamp.
+
+**Why `MP_RETRIEVE_SUBMITTED` is needed**: vLLM's IPC completion event is
+recorded on the CUDA stream between `MP_RETRIEVE_START` and `MP_RETRIEVE_END`.
+When vLLM unblocks on that event, it can call `end_session()` before the GPU
+callback for `MP_RETRIEVE_END` fires. EventBus queue becomes:
+`→ MP_RETRIEVE_START → MP_REQUEST_END → MP_RETRIEVE_END`
+Without `MP_RETRIEVE_SUBMITTED`, `_on_session_end` sees no in-flight work and
+closes the root span before the retrieve child span ends.
+
+## Root Span Attributes
+
+In addition to `session_id`, the root `"request"` span carries ten hit rate
+and outcome attributes that are set when `MP_LOOKUP_PREFETCH_END` is processed:
+
+| Attribute | OTel type | Value |
+|-----------|-----------|-------|
+| `hit_tokens` | `int` | tokens found in L1+L2 (numerator) |
+| `requested_tokens` | `int` | chunk-aligned tokens submitted for lookup (denominator) |
+| `hit_rate` | `float` | `hit_tokens / requested_tokens`; `0.0` when denominator is zero |
+| `l1_hit_tokens` | `int` | tokens in the prefix L1 alone could serve |
+| `l2_hit_tokens` | `int` | tokens by which L2 extended that prefix |
+| `l1_hit_rate` | `float` | `l1_hit_tokens / requested_tokens`; `0.0` when denominator is zero |
+| `l2_hit_rate` | `float` | `l2_hit_tokens / requested_tokens`; `0.0` when denominator is zero |
+| `l1_hit_keys` | `int` | hit keys (one per object group, kv rank and chunk) L1 already held |
+| `l2_hit_keys` | `int` | hit keys loaded from L2 |
+| `early_exit_reason` | `str` | branch of `lookup()` that returned before submitting a prefetch; `""` on the normal path |
+
+`hit_rate` is stored as a precomputed float because trace UIs (Tempo, Jaeger)
+cannot derive it from two integer attributes at query time; the same reasoning
+applies to `l1_hit_rate` and `l2_hit_rate`.
+
+`l1_hit_tokens + l2_hit_tokens == hit_tokens` exactly — `l2` is the remainder
+of `found_count` after the L1-servable prefix, not an independent count.  The
+two rates therefore sum to `hit_rate` up to float rounding, not bit-for-bit.
+See [EVENTS.md](../v1/mp_observability/EVENTS.md) for the derivation and for
+the `early_exit_reason` vocabulary.
+
+**Invariant:** these attributes are set at `MP_LOOKUP_PREFETCH_END` time, while
+the root span is still open.  `LP_END` always precedes `MP_REQUEST_END` in the
+event stream, so the root span is guaranteed to be live in the registry when the
+attributes are written.
+
+**Store-only requests** (no `lookup_prefetch_start()` call) never emit
+`MP_LOOKUP_PREFETCH_END`, so the root span will not carry these attributes.
+
+### CB path — `cb.request` span
+
+The `hit_tokens` / `requested_tokens` / `hit_rate` trio also appears on the
+`"cb.request"` root span, set when `CB_LOOKUP_END` is processed by
+`BlendTracingSubscriber`.  The per-tier split and `early_exit_reason` are
+specific to the MP path and are not set on `"cb.request"`.
+
+`CB_LOOKUP_END` carries the hit accounting in its metadata, computed at the
+emit site in `lmcache/v1/multiprocess/modules/blend.py`
+(`BlendModule.cb_unified_lookup`):
+
+| Field | Value |
+|-------|-------|
+| `prefix_hit_tokens` | tokens covered by the prefix leg (L1+L2) |
+| `segmented_prefix_hit_tokens` | tokens retained past a mid-prefix gap (`--enable-segmented-prefix`) |
+| `non_prefix_hit_tokens` | tokens served by shifted (fingerprint-matched) chunks |
+| `hit_tokens` | `prefix_hit_tokens + segmented_prefix_hit_tokens + non_prefix_hit_tokens` (disjoint ranges) |
+| `requested_tokens` | `(num_tokens // chunk_size) * chunk_size` (chunk-aligned) |
+| `prefix_hits` | chunks found by the prefix leg (not fingerprint matching) |
+
+The subscriber stamps `hit_tokens`, `requested_tokens`, `hit_rate`, the three
+per-component token counts and rates, and `prefix_hits` onto `"cb.request"`.
+Every `CB_LOOKUP_END` emit site populates these fields, so `hit_rate` is always
+present on the span.
+
+## Request Scenarios
+
+### Scenario 1 — Full Cache Hit
+
+Path: `lookup_prefetch → retrieve → store`
+
+```
+CPU  ─[REQUEST_START]─[LP_START]─[LP_END]──[RETR_SUBMITTED]──[STORE_SUBMITTED]─[REQUEST_END]─►
+GPU  ──────────────────────────────[RETR_START]─[vLLM_IPC]─[RETR_END]──[STORE_START]─[STORE_END]─►
+
+root "request"  [═══════════════════════════════════════════════════════════════════════════════]
+  mp.lookup_prefetch    [══════════]
+  mp.retrieve                          [══════════════════]
+  mp.store                                                        [══════════════════════]
+```
+
+Root closes at `REQUEST_END` (deferred until both retrieve and store complete).
+
+---
+
+### Scenario 2 — Cache Miss (no retrieve)
+
+Path: `lookup_prefetch → store`, no retrieve
+
+```
+CPU  ─[REQUEST_START]─[LP_START]─[LP_END]──────────[STORE_SUBMITTED]─[REQUEST_END]─►
+GPU  ───────────────────────────────────────────────────────[STORE_START]─[STORE_END]─►
+
+root "request"  [═══════════════════════════════════════════════════════════════════]
+  mp.lookup_prefetch    [══════════]
+  mp.store                                                    [══════════════════════]
+```
+
+No retrieve occurred, so `mp.retrieve` is absent.
+
+---
+
+### Scenario 3 — Lookup Only
+
+Path: `lookup_prefetch` only, no store
+
+```
+CPU  ─[REQUEST_START]─[LP_START]─[LP_END]─[REQUEST_END]─►
+
+root "request"  [════════════════════════════════════════]
+  mp.lookup_prefetch    [══════════]
+```
+
+Root closes immediately at `REQUEST_END`.
+
+---
+
+### Scenario 4 — Store Only (no lookup)
+
+Path: `store` with no prior `lookup_prefetch_start()` call
+
+```
+CPU  ─(no REQUEST_START)──────[STORE_SUBMITTED]─[REQUEST_END]─►
+GPU  ──────────────────────────────────[STORE_START]─[STORE_END]─►
+
+root "request" (lazy, created at MP_STORE_START)
+                                       [═════════════════════════]
+  mp.store                             [══════════════]
+```
+
+`MP_REQUEST_START` is only emitted from `lookup_prefetch_start()`. If that path
+was not taken, `_get_or_create_request_span()` is called lazily on the first child
+`_on_start()`. Root start time equals `STORE_START` timestamp.
+
+---
+
+### Scenario 5 — REQUEST_END Races GPU Store
+
+`end_session()` called before the GPU store callback fires.
+
+```
+CPU  ─[REQUEST_START]─[LP_START]─[LP_END]─[STORE_SUBMITTED]─[REQUEST_END]────────────────────►
+GPU  ──────────────────────────────────────────────[STORE_START]──────────────[STORE_END]─────►
+                                                                       ▲
+                                              REQUEST_END arrives here─┘ (before STORE_END)
+
+root "request"  [═══════════════════════════════════════════════════════════════════════════]
+  mp.lookup_prefetch    [══════════]
+  mp.store                                                    [═══════════════════]
+                                                                                  ▲
+                   STORE_SUBMITTED → count=1                                      │
+                   REQUEST_END → count>0 → defer (save ts)                        │
+                   STORE_END → count=0 → _close_request_span(deferred_ts) ────────────────┘
+```
+
+---
+
+### Scenario 6 — Multiple Stores, Deferred Close
+
+Two concurrent stores; root stays open until both complete.
+
+```
+CPU  ─[REQUEST_START]─[LP_START]─[LP_END]─[SUBMITTED×2]─[REQUEST_END]──────────────────────────────────►
+GPU  ────────────────────────────────────────────────────[S1_START]─[S1_END]─[S2_START]─[S2_END]────────►
+
+root "request"  [═══════════════════════════════════════════════════════════════════════════════════════]
+  mp.lookup_prefetch    [══════════]
+  mp.store (1)                                                       [══════════]
+  mp.store (2)                                                                    [══════════]
+                                                                                            ▲
+                   count=2 at REQUEST_END → defer                                           │
+                   S1_END → count=1 → still open                                            │
+                   S2_END → count=0 → _close_request_span(deferred_ts) ─────────────────────────────┘
+```
+
+## Summary
+
+| Scenario | Root opens | Root closes |
+|----------|-----------|-------------|
+| Full hit | `MP_REQUEST_START` | last `MP_STORE_END` / `MP_RETRIEVE_END` (stamped at `REQUEST_END` time) |
+| Cache miss | `MP_REQUEST_START` | last `MP_STORE_END` (stamped at `REQUEST_END` time) |
+| Lookup only | `MP_REQUEST_START` | `REQUEST_END` (immediate) |
+| Store only | `MP_STORE_START` (lazy) | `REQUEST_END` (immediate) |
+| REQUEST_END races store | `MP_REQUEST_START` | last `MP_STORE_END` (stamped at `REQUEST_END` time) |
+| REQUEST_END races retrieve | `MP_REQUEST_START` | last `MP_RETRIEVE_END` (stamped at `REQUEST_END` time) |
+| Multiple stores | `MP_REQUEST_START` | last `MP_STORE_END` (stamped at `REQUEST_END` time) |
+
+## Implementation
+
+| File | Change |
+|------|--------|
+| `lmcache/v1/mp_observability/event.py` | Add `MP_REQUEST_START`, `MP_STORE_SUBMITTED`, `MP_RETRIEVE_SUBMITTED`, `MP_REQUEST_END` |
+| `lmcache/v1/multiprocess/server.py` | Emit the 4 events at `lookup_prefetch_start()`, `store()`, `retrieve()`, `end_session()` |
+| `lmcache/v1/mp_observability/subscribers/tracing/mp_server.py` | Root span logic: `_pending_store_count`, `_pending_retrieve_count`, `_deferred_session_end_ts`; handlers `_on_request_start`, `_on_store_submitted`, `_on_retrieve_submitted`, `_on_session_end`; helpers `_get_or_create_request_span`, `_close_request_span` |
+| `lmcache/v1/mp_observability/subscribers/tracing/span_registry.py` | `SpanRegistry`: shared dict of open spans keyed by `(session_id, span_name)` for cross-subscriber parent lookup |
+| `tests/v1/mp_observability/subscribers/tracing/test_mp_server.py` | Tests for all scenarios including retrieve deferral |
+| `lmcache/v1/multiprocess/modules/blend.py` | `prefix_hits` and per-component hit tokens in `CB_LOOKUP_END` metadata |
+| `lmcache/v1/mp_observability/subscribers/tracing/cb_server.py` | Stamp `prefix_hits` and hit rates on `"cb.request"` root span from `CB_LOOKUP_END` |
+| `tests/v1/mp_observability/subscribers/tracing/test_cb_server.py` | `prefix_hits` attribute tests |
+
+---
+
+## Extending the Span Hierarchy
+
+### How the registry works
+
+`MPServerTracingSubscriber` writes every open span into a shared
+`SpanRegistry` while it is live:
+
+```
+registry[(session_id, "request")]       → (root_span, root_ctx)       # open: REQUEST_START → REQUEST_END
+registry[(session_id, "retrieve")]      → (retrieve_span, ctx)         # open: RETRIEVE_START → RETRIEVE_END
+registry[(session_id, "store")]         → (store_span, ctx)            # open: STORE_START → STORE_END
+registry[(session_id, "lookup_prefetch")] → (lp_span, ctx)            # open: LP_START → LP_END
+```
+
+Any subscriber that receives the same `SpanRegistry` instance can call
+`registry.get_context(session_id, "request")` (or any other name) to obtain
+the OTel context needed to nest a new span.
+
+---
+
+### Example 1 — new span at the same level
+
+To add an `l1.read` span nested directly under the root `"request"` span,
+create a new subscriber file and register it with the shared registry.
+No existing files need to change.
+
+**`subscribers/tracing/l1.py`**:
+
+```python
+# SPDX-License-Identifier: Apache-2.0
+from opentelemetry import trace
+
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
+from lmcache.v1.mp_observability.subscribers.tracing.span_registry import SpanRegistry
+
+_tracer = trace.get_tracer("lmcache_mp.l1")
+
+class L1TracingSubscriber(EventSubscriber):
+    def __init__(self, registry: SpanRegistry) -> None:
+        self._registry = registry
+        self._pending: dict[str, object] = {}
+
+    def get_subscriptions(self) -> dict[EventType, EventCallback]:
+        return {
+            EventType.L1_READ_RESERVED: self._on_start,
+            EventType.L1_READ_FINISHED: self._on_end,
+        }
+
+    def _on_start(self, event: Event) -> None:
+        parent_ctx = self._registry.get_context(event.session_id, "request")
+        span = _tracer.start_span(
+            "l1.read", context=parent_ctx, start_time=int(event.timestamp * 1e9)
+        )
+        self._pending[event.session_id] = span
+
+    def _on_end(self, event: Event) -> None:
+        span = self._pending.pop(event.session_id, None)
+        if span:
+            span.end(end_time=int(event.timestamp * 1e9))
+```
+
+**`config.py`** (the only change needed):
+
+```python
+registry = SpanRegistry()
+bus.register_subscriber(MPServerTracingSubscriber(registry))
+bus.register_subscriber(L1TracingSubscriber(registry))   # ← add this line
+```
+
+This produces: `request → l1.read` (alongside `mp.retrieve`, `mp.store`, etc.)
+
+---
+
+### Example 2 — sub-span nested under an existing child span
+
+To nest a span *inside* `mp.retrieve` (e.g. an L2 disk load that happens
+during a retrieve), look up `"retrieve"` as the parent instead of `"request"`.
+The `"retrieve"` entry is live in the registry from `MP_RETRIEVE_START` to
+`MP_RETRIEVE_END`.
+
+```python
+    def _on_detail_start(self, event: Event) -> None:
+        sid = event.session_id
+        # Prefer the immediate parent; fall back to root if retrieve has ended.
+        parent_ctx = (
+            self._registry.get_context(sid, "retrieve")
+            or self._registry.get_context(sid, "request")
+        )
+        span = _tracer.start_span(
+            "l2.disk_load", context=parent_ctx, start_time=int(event.timestamp * 1e9)
+        )
+        self._pending[sid] = span
+```
+
+This produces a three-level trace: `request → mp.retrieve → l2.disk_load`.
+
+---
+
+### Example 3 — attaching work that finishes after the parent ended
+
+GPU-clocked samples (`MP_TRANSFER_PHASE_SAMPLES`) are popped when a transfer's
+`MP_*_END` is dispatched -- after `mp.store` / `mp.retrieve` has ended and been
+popped from the registry, and possibly across several pops when other
+transfers end in between. `TransferPhaseTracingSubscriber`
+therefore captures the parent context on `MP_*_START` and keeps it (bounded by
+a TTL) and accumulates the transfer's samples. One request stores several
+chunks, so a session id maps to *several* same-direction transfers. Each
+transfer therefore mints its own `transfer_key` at the call site, echoed on
+both `MP_*_START` and `MP_*_END` and carried down into the native call, and
+the subscriber keys its table by that rather than by `(session_id,
+direction)`. One slot per session drops all but one of a five-chunk request's
+phase span pairs; matching them FIFO instead is not enough either, because
+`pop_completed_phase_timings()` is a process-global pop, so a single samples
+batch can carry several transfers' sections in arbitrary order. In the sample
+tuple the key travels in the `session_id` slot -- the native layer has no
+separate field for it -- so that value is a transfer key, not a session id.
+The direction is still checked against the key's transfer, or a mislabelled
+sample would hang a retrieve phase under a store span. `MP_*_END` is published on the
+transfer stream, so any samples event queued after it was popped after the
+last section finished: at the first samples event after END the subscriber
+starts one child per phase with
+explicit `start_time` / `end_time` against the retained context. OTel accepts children of an ended parent as long as the
+timestamps are supplied. The children are stacked back to back (each as long
+as its phase's total elapsed) rather than placed at their real, interleaved
+intervals, so the bars read as a breakdown.
+
+```python
+    def _on_transfer_start(self, event: Event) -> None:
+        parent = _PARENT_BY_EVENT[event.event_type]
+        ctx = self._registry.get_context(event.session_id, parent)
+        self._transfers[str(event.metadata["transfer_key"])] = _TransferTotals(
+            session_id=event.session_id, parent=parent, parent_ctx=ctx,
+            captured_at=time.monotonic())
+
+    def _flush(self) -> None:
+        cursor_s = transfer_first_start_s
+        for phase, totals in phases_in_execution_order:
+            span = _tracer.start_span(name_of(phase), context=parent_ctx,
+                                      start_time=int(cursor_s * 1e9))
+            span.set_attribute("elapsed_seconds", totals.elapsed_s)
+            cursor_s += totals.elapsed_s
+            span.end(end_time=int(cursor_s * 1e9))
+```
+
+This produces `request → mp.store → transfer.kernel_interval / transfer.staging`
+(one child per phase, stacked, each as long as that phase's total elapsed).
+
+### Reading the phase bars
+
+A bar's length is the interval between two CUDA events on the transfer stream,
+which is not the time that phase's work spent running.  A stream's ordering
+guarantee says op N+1 starts after op N, not that the device served this
+stream in between.  The two phases sit on opposite sides of that distinction:
+the staging copy is DMA on a copy engine, hardware the co-resident inference
+engine never asks for, so its bar is the transfer; the gather/scatter kernel
+needs SMs, which the engine holds, so its bar is mostly the wait for the
+engine's kernels to retire.
+
+A trace shows this against itself.  At a 2048-token chunked-prefill budget a
+9984-token prompt stores five chunks, and the fifth is issued after prefill
+has finished, onto an empty stream.  In one such trace the first four kernel
+bars read ~10.0 ms for 117 MB (11.7 GB/s) and the fifth read 0.18 ms for
+102 MB (571 GB/s) -- same code, a payload within 12%, 56x apart.  Across 15
+traces the medians were 11.4 GB/s for non-final chunks against 571.0 GB/s for
+final ones, while staging held at 18.1 GB/s throughout.  The empty-stream
+figure is the real one: profiling both processes on the same box put the d2h
+kernel at 21 us / 636 GB/s while its section read ~1280 us, the 1104 us gap
+ahead of it being the engine's own kernels.
+
+So a long kernel bar reads as *this transfer met a busy engine*, not *this
+copy was slow*, and dividing its `nbytes` by its duration is meaningless --
+`METRICS.md` ships no kernel throughput metric for that reason.  The bar is
+kept because that distinction, met-a-busy-engine versus slow-link, is worth
+seeing per transfer, and staging's bar beside it is the one that answers the
+link question.
+
+The wait is also not a cost the request pays.  The store bars in that trace
+sit ~170 ms apart -- the chunked-prefill cadence -- so each one overlaps the
+prefill step that is delaying it, and the 21.5 ms bars do not lengthen the
+859 ms request.
